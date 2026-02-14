@@ -53,9 +53,15 @@ struct IdentifiedMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Platform {
-    #[serde(rename = "type")]
-    platform_type: String,
+#[serde(rename_all = "camelCase")]
+enum Platform {
+    Soop {},
+    Kick {},
+    OpenStreamingPlatform {},
+    Twitch {},
+    YouTube {},
+    #[serde(rename = "dlive")]
+    DLive {},
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -180,9 +186,7 @@ impl Assistant {
     fn create_chat_message_request(&mut self, message: &str) -> serde_json::Value {
         let chat_message = ChatMessage {
             id: self.next_chat_message_id(),
-            platform: Platform {
-                platform_type: "assistant".to_string(),
-            },
+            platform: Platform::Twitch {},
             message_id: None,
             display_name: Some("Assistant".to_string()),
             user: Some("assistant".to_string()),
