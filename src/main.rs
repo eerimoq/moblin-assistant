@@ -245,22 +245,21 @@ async fn connect_twitch_irc(
     writer: WsWriter,
     assistant: Arc<Mutex<Assistant>>,
     channel_name: String,
-    access_token: String,
+    _access_token: String,
     addr: String,
 ) {
     log(&addr, &format!("Connecting to Twitch IRC for channel: {}", channel_name));
 
-    let credentials = StaticLoginCredentials::new(
-        "justinfan12345".to_owned(),
-        Some(access_token),
-    );
+    // Use anonymous credentials since we only need to read chat messages
+    let credentials = StaticLoginCredentials::anonymous();
     let config = ClientConfig::new_simple(credentials);
     let (mut incoming_messages, client) =
         TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(config);
 
+    // twitch-irc crate expects channel names without '#' prefix, in lowercase
     let channel = channel_name.trim_start_matches('#').to_lowercase();
     if let Err(e) = client.join(channel.clone()) {
-        log_error(&addr, &format!("Failed to join Twitch channel: {}", e));
+        log_error(&addr, &format!("Failed to join Twitch channel '{}': {}", channel, e));
         return;
     }
 
@@ -282,6 +281,7 @@ async fn connect_twitch_irc(
 
             let is_moderator = msg.badges.iter().any(|b| b.name == "moderator");
             let is_subscriber = msg.badges.iter().any(|b| b.name == "subscriber");
+            let is_owner = msg.badges.iter().any(|b| b.name == "broadcaster");
 
             let mut assistant_locked = assistant.lock().await;
             let chat_message_id = assistant_locked.next_chat_message_id();
@@ -306,7 +306,7 @@ async fn connect_twitch_irc(
                 is_action: msg.is_action,
                 is_moderator,
                 is_subscriber,
-                is_owner: false,
+                is_owner,
                 bits: msg.bits.map(|b| b.to_string()),
             };
 
