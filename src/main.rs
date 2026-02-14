@@ -496,8 +496,9 @@ async fn handle_twitch_start_message(
             // Use channel_name if provided, otherwise use the channel_id
             let channel = twitch_start
                 .channel_name
-                .clone()
-                .unwrap_or_else(|| channel_id.clone());
+                .as_ref()
+                .unwrap_or(channel_id)
+                .clone();
             info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
             tokio::spawn(connect_twitch_irc(
                 writer.clone(),
