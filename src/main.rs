@@ -112,9 +112,15 @@ struct ChatMessagesRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum RequestData {
+    ChatMessages(ChatMessagesRequest),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct RequestMessage {
     id: i32,
-    data: serde_json::Value,
+    data: RequestData,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -186,24 +192,18 @@ impl Assistant {
         self.chat_message_id
     }
 
-    fn create_hello_message(&self) -> serde_json::Value {
-        json!({
-            "hello": {
-                "apiVersion": API_VERSION,
-                "authentication": {
-                    "challenge": self.challenge,
-                    "salt": self.salt
-                }
-            }
-        })
+    fn create_hello_message(&self) -> HelloMessage {
+        HelloMessage {
+            api_version: API_VERSION.to_string(),
+            authentication: Authentication {
+                challenge: self.challenge.clone(),
+                salt: self.salt.clone(),
+            },
+        }
     }
 
-    fn create_identified_message(&self, result: IdentifiedResult) -> serde_json::Value {
-        json!({
-            "identified": {
-                "result": result
-            }
-        })
+    fn create_identified_message(&self, result: IdentifiedResult) -> IdentifiedMessage {
+        IdentifiedMessage { result }
     }
 
     fn create_pong_message(&self) -> serde_json::Value {
@@ -355,17 +355,13 @@ async fn connect_twitch_irc(
                 bits: msg.bits.map(|b| b.to_string()),
             };
 
-            let chat_request = json!({
-                "request": {
-                    "id": request_id,
-                    "data": {
-                        "chatMessages": {
-                            "history": false,
-                            "messages": [chat_msg]
-                        }
-                    }
-                }
-            });
+            let chat_request = RequestMessage {
+                id: request_id,
+                data: RequestData::ChatMessages(ChatMessagesRequest {
+                    history: false,
+                    messages: vec![chat_msg],
+                }),
+            };
 
             if let Ok(msg_str) = serde_json::to_string(&chat_request) {
                 debug!("[{addr}] Forwarding Twitch chat message: {msg_str}");
@@ -505,7 +501,6 @@ async fn handle_streamer_connection(
     let (write, mut read) = ws_stream.split();
     let writer: WsWriter = Arc::new(Mutex::new(write));
 
-    // Send hello message
     {
         let assistant = assistant.lock().await;
         let hello = assistant.create_hello_message();
@@ -522,7 +517,6 @@ async fn handle_streamer_connection(
         debug!("[{addr}] Sent hello message with authentication challenge");
     }
 
-    // Handle incoming messages
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(m) => m,
