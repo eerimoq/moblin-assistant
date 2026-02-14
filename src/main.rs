@@ -111,6 +111,7 @@ struct Assistant {
     salt: String,
     identified: bool,
     request_id: i32,
+    chat_message_id: i32,
 }
 
 impl Assistant {
@@ -121,6 +122,7 @@ impl Assistant {
             salt: random_string(),
             identified: false,
             request_id: 0,
+            chat_message_id: 0,
         }
     }
 
@@ -141,6 +143,11 @@ impl Assistant {
     fn next_id(&mut self) -> i32 {
         self.request_id += 1;
         self.request_id
+    }
+
+    fn next_chat_message_id(&mut self) -> i32 {
+        self.chat_message_id += 1;
+        self.chat_message_id
     }
 
     fn create_hello_message(&self) -> serde_json::Value {
@@ -171,7 +178,7 @@ impl Assistant {
 
     fn create_chat_message_request(&mut self, message: &str) -> serde_json::Value {
         let chat_message = ChatMessage {
-            id: 1,
+            id: self.next_chat_message_id(),
             platform: Platform {
                 platform_type: "assistant".to_string(),
             },
@@ -243,7 +250,7 @@ async fn handle_streamer_connection(
         let assistant = assistant.lock().await;
         let hello = assistant.create_hello_message();
         if let Err(e) = write
-            .send(Message::Text(serde_json::to_string(&hello).unwrap()))
+            .send(Message::Text(serde_json::to_string(&hello).expect("Failed to serialize hello message")))
             .await
         {
             eprintln!("Error sending hello: {}", e);
@@ -292,8 +299,11 @@ async fn handle_streamer_connection(
                         };
 
                         let response = assistant_locked.create_identified_message(result);
+                        let is_identified = assistant_locked.identified;
+                        drop(assistant_locked); // Release lock before sleeping
+                        
                         if let Err(e) = write
-                            .send(Message::Text(serde_json::to_string(&response).unwrap()))
+                            .send(Message::Text(serde_json::to_string(&response).expect("Failed to serialize identified response")))
                             .await
                         {
                             eprintln!("Error sending identified: {}", e);
@@ -301,10 +311,13 @@ async fn handle_streamer_connection(
                         }
 
                         // If identified successfully, send hardcoded chat messages after a delay
-                        if assistant_locked.identified {
+                        if is_identified {
                             // Send first chat message after 2 seconds
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            let mut assistant_locked = assistant.lock().await;
                             let chat_request = assistant_locked.create_chat_message_request("Hello from Rust Moblin Assistant! 🎉");
+                            drop(assistant_locked); // Release lock
+                            
                             if let Ok(msg_str) = serde_json::to_string(&chat_request) {
                                 println!("Sending chat message: {}", msg_str);
                                 if let Err(e) = write.send(Message::Text(msg_str)).await {
@@ -315,7 +328,10 @@ async fn handle_streamer_connection(
                             
                             // Send second message after 3 more seconds
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                            let mut assistant_locked = assistant.lock().await;
                             let chat_request2 = assistant_locked.create_chat_message_request("This is a second hardcoded message!");
+                            drop(assistant_locked); // Release lock
+                            
                             if let Ok(msg_str) = serde_json::to_string(&chat_request2) {
                                 println!("Sending second chat message: {}", msg_str);
                                 if let Err(e) = write.send(Message::Text(msg_str)).await {
@@ -331,8 +347,10 @@ async fn handle_streamer_connection(
                 if json_msg.get("ping").is_some() {
                     let assistant_locked = assistant.lock().await;
                     let pong = assistant_locked.create_pong_message();
+                    drop(assistant_locked);
+                    
                     if let Err(e) = write
-                        .send(Message::Text(serde_json::to_string(&pong).unwrap()))
+                        .send(Message::Text(serde_json::to_string(&pong).expect("Failed to serialize pong message")))
                         .await
                     {
                         eprintln!("Error sending pong: {}", e);
@@ -373,7 +391,6 @@ async fn main() {
     let args = Args::parse();
 
     println!("Starting Moblin Assistant server on port {}", args.port);
-    println!("Password: {}", args.password);
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", args.port))
         .await
