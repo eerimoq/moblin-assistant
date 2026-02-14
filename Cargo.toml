@@ -18,3 +18,5 @@ futures-util = "0.3"
 twitch-irc = { version = "5.0", features = ["transport-tcp", "transport-tcp-native-tls"] }
 log = "0.4"
 env_logger = "0.11"
+reqwest = { version = "0.12", features = ["json"] }
+regex = "1"
