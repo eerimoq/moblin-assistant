@@ -300,29 +300,29 @@ async fn handle_streamer_connection(
                             break;
                         }
 
-                        // If identified successfully, send a hardcoded chat message after 2 seconds
+                        // If identified successfully, send hardcoded chat messages after a delay
                         if assistant_locked.identified {
-                            let assistant_clone = Arc::clone(&assistant);
-                            let mut write_clone = write;
-                            tokio::spawn(async move {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                let mut assistant = assistant_clone.lock().await;
-                                let chat_request = assistant.create_chat_message_request("Hello from Rust Moblin Assistant! 🎉");
-                                if let Ok(msg_str) = serde_json::to_string(&chat_request) {
-                                    println!("Sending chat message: {}", msg_str);
-                                    let _ = write_clone.send(Message::Text(msg_str)).await;
+                            // Send first chat message after 2 seconds
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            let chat_request = assistant_locked.create_chat_message_request("Hello from Rust Moblin Assistant! 🎉");
+                            if let Ok(msg_str) = serde_json::to_string(&chat_request) {
+                                println!("Sending chat message: {}", msg_str);
+                                if let Err(e) = write.send(Message::Text(msg_str)).await {
+                                    eprintln!("Error sending chat message: {}", e);
+                                    break;
                                 }
-                                
-                                // Send another message after 3 seconds
-                                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                let chat_request2 = assistant.create_chat_message_request("This is a second hardcoded message!");
-                                if let Ok(msg_str) = serde_json::to_string(&chat_request2) {
-                                    println!("Sending second chat message: {}", msg_str);
-                                    let _ = write_clone.send(Message::Text(msg_str)).await;
+                            }
+                            
+                            // Send second message after 3 more seconds
+                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                            let chat_request2 = assistant_locked.create_chat_message_request("This is a second hardcoded message!");
+                            if let Ok(msg_str) = serde_json::to_string(&chat_request2) {
+                                println!("Sending second chat message: {}", msg_str);
+                                if let Err(e) = write.send(Message::Text(msg_str)).await {
+                                    eprintln!("Error sending second chat message: {}", e);
+                                    break;
                                 }
-                            });
-                            // Break the loop since we spawned a task to handle messages
-                            break;
+                            }
                         }
                     }
                 }
