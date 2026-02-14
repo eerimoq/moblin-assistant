@@ -332,10 +332,10 @@ async fn connect_twitch_irc(
             let is_subscriber = msg.badges.iter().any(|b| b.name == "subscriber");
             let is_owner = msg.badges.iter().any(|b| b.name == "broadcaster");
 
-            let mut assistant_locked = assistant.lock().await;
-            let chat_message_id = assistant_locked.next_chat_message_id();
-            let request_id = assistant_locked.next_id();
-            drop(assistant_locked);
+            let mut assistant = assistant.lock().await;
+            let chat_message_id = assistant.next_chat_message_id();
+            let request_id = assistant.next_id();
+            drop(assistant);
 
             let chat_msg = ChatMessage {
                 id: chat_message_id,
@@ -384,14 +384,14 @@ async fn handle_identify_message(
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     debug!("[{addr}] Processing identify message");
-    let mut assistant_locked = assistant.lock().await;
-    let expected_hash = assistant_locked.hash_password();
+    let mut assistant = assistant.lock().await;
+    let expected_hash = assistant.hash_password();
 
-    let result = if assistant_locked.identified {
+    let result = if assistant.identified {
         debug!("[{addr}] Streamer already identified");
         IdentifiedResult::AlreadyIdentified {}
     } else if identify.authentication == expected_hash {
-        assistant_locked.identified = true;
+        assistant.identified = true;
         info!("[{addr}] Streamer successfully identified");
         IdentifiedResult::Ok {}
     } else {
@@ -399,9 +399,9 @@ async fn handle_identify_message(
         IdentifiedResult::WrongPassword {}
     };
 
-    let response = assistant_locked.create_identified_message(result);
-    let is_identified = assistant_locked.identified;
-    drop(assistant_locked);
+    let response = assistant.create_identified_message(result);
+    let is_identified = assistant.identified;
+    drop(assistant);
 
     let mut write = writer.lock().await;
     write
@@ -424,9 +424,9 @@ async fn handle_ping_message(
     assistant: &Arc<Mutex<Assistant>>,
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let assistant_locked = assistant.lock().await;
-    let pong = assistant_locked.create_pong_message();
-    drop(assistant_locked);
+    let assistant = assistant.lock().await;
+    let pong = assistant.create_pong_message();
+    drop(assistant);
 
     let mut write = writer.lock().await;
     write
@@ -463,6 +463,10 @@ async fn handle_twitch_start_message(
 
 async fn handle_response_message(addr: &str) {
     debug!("[{addr}] Received response from streamer");
+}
+
+async fn is_identified(assistant: &Arc<Mutex<Assistant>>) -> bool {
+    assistant.lock().await.identified
 }
 
 async fn handle_websocket_ping(
@@ -554,12 +558,21 @@ async fn handle_streamer_connection(
                         }
                     }
                     IncomingMessage::Event(_) => {
+                        if !is_identified(&assistant).await {
+                            break;
+                        }
                         handle_event_message(&addr).await;
                     }
                     IncomingMessage::TwitchStart(twitch_start) => {
+                        if !is_identified(&assistant).await {
+                            break;
+                        }
                         handle_twitch_start_message(twitch_start, &writer, &assistant, &addr).await;
                     }
                     IncomingMessage::Response(_) => {
+                        if !is_identified(&assistant).await {
+                            break;
+                        }
                         handle_response_message(&addr).await;
                     }
                 }
