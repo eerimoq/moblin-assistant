@@ -72,12 +72,12 @@ struct RgbColor {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum ChatPostSegment {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "url")]
-    Url { url: String },
+struct ChatPostSegment {
+    id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -197,8 +197,10 @@ impl Assistant {
                 blue: 255,
             }),
             user_badges: vec![],
-            segments: vec![ChatPostSegment::Text {
-                text: message.to_string(),
+            segments: vec![ChatPostSegment {
+                id: 0,
+                text: Some(message.to_string()),
+                url: None,
             }],
             timestamp: chrono::Utc::now().to_rfc3339(),
             is_action: false,
