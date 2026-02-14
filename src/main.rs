@@ -118,6 +118,30 @@ struct RequestMessage {
     data: serde_json::Value,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentifyData {
+    authentication: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TwitchStartData {
+    channel_name: Option<String>,
+    channel_id: Option<String>,
+    access_token: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum IncomingMessage {
+    Identify(IdentifyData),
+    Ping(serde_json::Value),
+    Event(serde_json::Value),
+    TwitchStart(TwitchStartData),
+    Response(serde_json::Value),
+}
+
 struct Assistant {
     password: String,
     challenge: String,
@@ -388,48 +412,44 @@ async fn connect_twitch_irc(
 }
 
 async fn handle_identify_message(
-    identify: &serde_json::Value,
+    identify: &IdentifyData,
     writer: &WsWriter,
     assistant: &Arc<Mutex<Assistant>>,
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     debug!("[{addr}] Processing identify message");
-    if let Some(auth) = identify.get("authentication").and_then(|a| a.as_str()) {
-        let mut assistant_locked = assistant.lock().await;
-        let expected_hash = assistant_locked.hash_password();
+    let mut assistant_locked = assistant.lock().await;
+    let expected_hash = assistant_locked.hash_password();
 
-        let result = if assistant_locked.identified {
-            debug!("[{addr}] Streamer already identified");
-            IdentifiedResult::AlreadyIdentified {}
-        } else if auth == expected_hash {
-            assistant_locked.identified = true;
-            info!("[{addr}] Streamer successfully identified");
-            IdentifiedResult::Ok {}
-        } else {
-            error!("[{addr}] Wrong password from streamer");
-            IdentifiedResult::WrongPassword {}
-        };
-
-        let response = assistant_locked.create_identified_message(result);
-        let is_identified = assistant_locked.identified;
-        drop(assistant_locked);
-
-        let mut write = writer.lock().await;
-        write
-            .send(Message::Text(
-                serde_json::to_string(&response)
-                    .expect("Failed to serialize identified response"),
-            ))
-            .await?;
-        debug!("[{addr}] Sent identified response");
-        drop(write);
-
-        // If identified successfully, start processing Twitch messages
-        if is_identified {
-            debug!("[{addr}] Streamer identified, waiting for twitchStart message");
-        }
+    let result = if assistant_locked.identified {
+        debug!("[{addr}] Streamer already identified");
+        IdentifiedResult::AlreadyIdentified {}
+    } else if identify.authentication == expected_hash {
+        assistant_locked.identified = true;
+        info!("[{addr}] Streamer successfully identified");
+        IdentifiedResult::Ok {}
     } else {
-        error!("[{addr}] Identify message missing authentication field");
+        error!("[{addr}] Wrong password from streamer");
+        IdentifiedResult::WrongPassword {}
+    };
+
+    let response = assistant_locked.create_identified_message(result);
+    let is_identified = assistant_locked.identified;
+    drop(assistant_locked);
+
+    let mut write = writer.lock().await;
+    write
+        .send(Message::Text(
+            serde_json::to_string(&response)
+                .expect("Failed to serialize identified response"),
+        ))
+        .await?;
+    debug!("[{addr}] Sent identified response");
+    drop(write);
+
+    // If identified successfully, start processing Twitch messages
+    if is_identified {
+        debug!("[{addr}] Streamer identified, waiting for twitchStart message");
     }
     Ok(())
 }
@@ -458,33 +478,26 @@ async fn handle_event_message(addr: &str) {
 }
 
 async fn handle_twitch_start_message(
-    twitch_start: &serde_json::Value,
+    twitch_start: &TwitchStartData,
     writer: &WsWriter,
     assistant: &Arc<Mutex<Assistant>>,
     addr: &str,
 ) {
     debug!("[{addr}] Received twitchStart message");
-    let channel_name = twitch_start
-        .get("channelName")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let channel_id = twitch_start
-        .get("channelId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let encrypted_token = twitch_start
-        .get("accessToken")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
 
-    if let (Some(encrypted_token), Some(channel_id)) = (encrypted_token, channel_id) {
+    if let (Some(encrypted_token), Some(channel_id)) =
+        (&twitch_start.access_token, &twitch_start.channel_id)
+    {
         let assistant_locked = assistant.lock().await;
         let password = assistant_locked.password.clone();
         drop(assistant_locked);
 
-        if let Some(access_token) = decrypt_access_token(&password, &encrypted_token) {
+        if let Some(access_token) = decrypt_access_token(&password, encrypted_token) {
             // Use channel_name if provided, otherwise use the channel_id
-            let channel = channel_name.unwrap_or_else(|| channel_id.clone());
+            let channel = twitch_start
+                .channel_name
+                .clone()
+                .unwrap_or_else(|| channel_id.clone());
             info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
             tokio::spawn(connect_twitch_irc(
                 writer.clone(),
@@ -572,7 +585,7 @@ async fn handle_streamer_connection(
             Message::Text(text) => {
                 debug!("[{addr}] Received message: {text}");
 
-                let json_msg: serde_json::Value = match serde_json::from_str(&text) {
+                let incoming: IncomingMessage = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
                         error!("[{addr}] Error parsing JSON: {e}");
@@ -580,35 +593,28 @@ async fn handle_streamer_connection(
                     }
                 };
 
-                // Handle identify message
-                if let Some(identify) = json_msg.get("identify") {
-                    if let Err(e) = handle_identify_message(identify, &writer, &assistant, &addr).await {
-                        error!("[{addr}] Error handling identify message: {e}");
-                        break;
+                match &incoming {
+                    IncomingMessage::Identify(identify) => {
+                        if let Err(e) = handle_identify_message(identify, &writer, &assistant, &addr).await {
+                            error!("[{addr}] Error handling identify message: {e}");
+                            break;
+                        }
                     }
-                }
-
-                // Handle ping message
-                if json_msg.get("ping").is_some() {
-                    if let Err(e) = handle_ping_message(&writer, &assistant, &addr).await {
-                        error!("[{addr}] Error handling ping message: {e}");
-                        break;
+                    IncomingMessage::Ping(_) => {
+                        if let Err(e) = handle_ping_message(&writer, &assistant, &addr).await {
+                            error!("[{addr}] Error handling ping message: {e}");
+                            break;
+                        }
                     }
-                }
-
-                // Handle event messages
-                if json_msg.get("event").is_some() {
-                    handle_event_message(&addr).await;
-                }
-
-                // Handle twitchStart message
-                if let Some(twitch_start) = json_msg.get("twitchStart") {
-                    handle_twitch_start_message(twitch_start, &writer, &assistant, &addr).await;
-                }
-
-                // Handle response messages
-                if json_msg.get("response").is_some() {
-                    handle_response_message(&addr).await;
+                    IncomingMessage::Event(_) => {
+                        handle_event_message(&addr).await;
+                    }
+                    IncomingMessage::TwitchStart(twitch_start) => {
+                        handle_twitch_start_message(twitch_start, &writer, &assistant, &addr).await;
+                    }
+                    IncomingMessage::Response(_) => {
+                        handle_response_message(&addr).await;
+                    }
                 }
             }
             Message::Ping(data) => {
@@ -804,5 +810,73 @@ mod tests {
         assert_eq!(url_count, 4);
         let last = segments.last().unwrap();
         assert_eq!(last.text.as_deref(), Some("test "));
+    }
+
+    #[test]
+    fn test_deserialize_identify_message() {
+        let json = r#"{"identify": {"authentication": "abc123"}}"#;
+        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            IncomingMessage::Identify(data) => {
+                assert_eq!(data.authentication, "abc123");
+            }
+            _ => panic!("Expected Identify variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_ping_message() {
+        let json = r#"{"ping": {}}"#;
+        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, IncomingMessage::Ping(_)));
+    }
+
+    #[test]
+    fn test_deserialize_event_message() {
+        let json = r#"{"event": {"type": "someEvent"}}"#;
+        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, IncomingMessage::Event(_)));
+    }
+
+    #[test]
+    fn test_deserialize_twitch_start_message() {
+        let json = r#"{"twitchStart": {"channelName": "mychannel", "channelId": "123", "accessToken": "encrypted"}}"#;
+        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            IncomingMessage::TwitchStart(data) => {
+                assert_eq!(data.channel_name.as_deref(), Some("mychannel"));
+                assert_eq!(data.channel_id.as_deref(), Some("123"));
+                assert_eq!(data.access_token.as_deref(), Some("encrypted"));
+            }
+            _ => panic!("Expected TwitchStart variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_twitch_start_message_minimal() {
+        let json = r#"{"twitchStart": {"channelId": "123", "accessToken": "encrypted"}}"#;
+        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            IncomingMessage::TwitchStart(data) => {
+                assert!(data.channel_name.is_none());
+                assert_eq!(data.channel_id.as_deref(), Some("123"));
+                assert_eq!(data.access_token.as_deref(), Some("encrypted"));
+            }
+            _ => panic!("Expected TwitchStart variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_response_message() {
+        let json = r#"{"response": {"id": 1}}"#;
+        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, IncomingMessage::Response(_)));
+    }
+
+    #[test]
+    fn test_deserialize_unknown_message() {
+        let json = r#"{"unknown": {}}"#;
+        let result: Result<IncomingMessage, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 }
