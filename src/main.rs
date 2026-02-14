@@ -295,107 +295,104 @@ async fn connect_twitch_irc(
     writer: WsWriter,
     assistant: Arc<Mutex<Assistant>>,
     channel_name: String,
-    addr: String,
+    peer_address: String,
 ) {
-    info!("[{addr}] Connecting to Twitch IRC for channel: {channel_name}");
+    info!("[{peer_address}] Connecting to Twitch IRC for channel: {channel_name}");
 
-    // Use anonymous credentials since we only need to read chat messages
     let credentials = StaticLoginCredentials::anonymous();
     let config = ClientConfig::new_simple(credentials);
-    let (mut incoming_messages, client) =
+    let (mut messages, client) =
         TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(config);
 
-    // twitch-irc crate expects channel names without '#' prefix, in lowercase
-    let channel = channel_name.trim_start_matches('#').to_lowercase();
-    if let Err(e) = client.join(channel.clone()) {
-        error!("[{addr}] Failed to join Twitch channel '{channel}': {e}");
+    if let Err(e) = client.join(channel_name.clone()) {
+        error!("[{peer_address}] Failed to join Twitch channel '{channel_name}': {e}");
         return;
     }
 
-    info!("[{addr}] Joined Twitch channel #{channel}");
+    info!("[{peer_address}] Joined Twitch channel #{channel_name}");
 
-    while let Some(message) = incoming_messages.recv().await {
-        if let ServerMessage::Privmsg(msg) = message {
-            let user_color = msg.name_color.map(|c| RgbColor {
+    while let Some(message) = messages.recv().await {
+        if let ServerMessage::Privmsg(message) = message {
+            let user_color = message.name_color.map(|c| RgbColor {
                 red: c.r as i32,
                 green: c.g as i32,
                 blue: c.b as i32,
             });
 
-            let user_badges: Vec<String> = msg
+            let user_badges: Vec<String> = message
                 .badges
                 .iter()
                 .map(|b| format!("{}/{}", b.name, b.version))
                 .collect();
 
-            let is_moderator = msg.badges.iter().any(|b| b.name == "moderator");
-            let is_subscriber = msg.badges.iter().any(|b| b.name == "subscriber");
-            let is_owner = msg.badges.iter().any(|b| b.name == "broadcaster");
+            let is_moderator = message.badges.iter().any(|b| b.name == "moderator");
+            let is_subscriber = message.badges.iter().any(|b| b.name == "subscriber");
+            let is_owner = message.badges.iter().any(|b| b.name == "broadcaster");
 
             let mut assistant = assistant.lock().await;
             let chat_message_id = assistant.next_chat_message_id();
             let request_id = assistant.next_id();
             drop(assistant);
 
-            let chat_msg = ChatMessage {
+            let chat_message = ChatMessage {
                 id: chat_message_id,
                 platform: Platform::Twitch {},
-                message_id: Some(msg.message_id.clone()),
-                display_name: Some(msg.sender.name.clone()),
-                user: Some(msg.sender.login.clone()),
-                user_id: Some(msg.sender.id.clone()),
+                message_id: Some(message.message_id.clone()),
+                display_name: Some(message.sender.name.clone()),
+                user: Some(message.sender.login.clone()),
+                user_id: Some(message.sender.id.clone()),
                 user_color,
                 user_badges,
-                segments: create_twitch_segments(&msg.message_text, &msg.emotes),
-                timestamp: msg.server_timestamp.to_rfc3339(),
-                is_action: msg.is_action,
+                segments: create_twitch_segments(&message.message_text, &message.emotes),
+                timestamp: message.server_timestamp.to_rfc3339(),
+                is_action: message.is_action,
                 is_moderator,
                 is_subscriber,
                 is_owner,
-                bits: msg.bits.map(|b| b.to_string()),
+                bits: message.bits.map(|b| b.to_string()),
             };
 
-            let chat_request = RequestMessage {
+            let request = RequestMessage {
                 id: request_id,
                 data: RequestData::ChatMessages(ChatMessagesRequest {
                     history: false,
-                    messages: vec![chat_msg],
+                    messages: vec![chat_message],
                 }),
             };
 
-            if let Ok(msg_str) = serde_json::to_string(&chat_request) {
-                debug!("[{addr}] Forwarding Twitch chat message: {msg_str}");
+            if let Ok(encoded) = serde_json::to_string(&request) {
+                debug!("[{peer_address}] Forwarding Twitch chat message: {encoded}");
                 let mut write = writer.lock().await;
-                if let Err(e) = write.send(Message::Text(msg_str)).await {
-                    error!("[{addr}] Error forwarding chat message: {e}");
+                if let Err(e) = write.send(Message::Text(encoded)).await {
+                    error!("[{peer_address}] Error forwarding chat message: {e}");
                     return;
                 }
             }
         }
     }
 
-    debug!("[{addr}] Twitch IRC connection ended");
+    debug!("[{peer_address}] Twitch IRC connection ended");
 }
 
 async fn handle_identify_message(
     identify: &IdentifyData,
     writer: &WsWriter,
     assistant: &Arc<Mutex<Assistant>>,
-    addr: &str,
+    peer_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    debug!("[{addr}] Processing identify message");
+    debug!("[{peer_address}] Processing identify message");
     let mut assistant = assistant.lock().await;
     let expected_hash = assistant.hash_password();
 
     let result = if assistant.identified {
-        debug!("[{addr}] Streamer already identified");
+        debug!("[{peer_address}] Streamer already identified");
         IdentifiedResult::AlreadyIdentified {}
     } else if identify.authentication == expected_hash {
         assistant.identified = true;
-        info!("[{addr}] Streamer successfully identified");
+        info!("[{peer_address}] Streamer successfully identified");
         IdentifiedResult::Ok {}
     } else {
-        error!("[{addr}] Wrong password from streamer");
+        error!("[{peer_address}] Wrong password from streamer");
         IdentifiedResult::WrongPassword {}
     };
 
@@ -409,12 +406,12 @@ async fn handle_identify_message(
             serde_json::to_string(&response).expect("Failed to serialize identified response"),
         ))
         .await?;
-    debug!("[{addr}] Sent identified response");
+    debug!("[{peer_address}] Sent identified response");
     drop(write);
 
     // If identified successfully, start processing Twitch messages
     if is_identified {
-        debug!("[{addr}] Streamer identified, waiting for twitchStart message");
+        debug!("[{peer_address}] Streamer identified, waiting for twitchStart message");
     }
     Ok(())
 }
@@ -422,7 +419,7 @@ async fn handle_identify_message(
 async fn handle_ping_message(
     writer: &WsWriter,
     assistant: &Arc<Mutex<Assistant>>,
-    addr: &str,
+    peer_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assistant = assistant.lock().await;
     let pong = assistant.create_pong_message();
@@ -434,35 +431,35 @@ async fn handle_ping_message(
             serde_json::to_string(&pong).expect("Failed to serialize pong message"),
         ))
         .await?;
-    debug!("[{addr}] Sent pong response");
+    debug!("[{peer_address}] Sent pong response");
     Ok(())
 }
 
-async fn handle_event_message(addr: &str) {
-    debug!("[{addr}] Received event from streamer");
+async fn handle_event_message(peer_address: &str) {
+    debug!("[{peer_address}] Received event from streamer");
 }
 
 async fn handle_twitch_start_message(
     twitch_start: &TwitchStartData,
     writer: &WsWriter,
     assistant: &Arc<Mutex<Assistant>>,
-    addr: &str,
+    peer_address: &str,
 ) {
-    debug!("[{addr}] Received twitchStart message");
+    debug!("[{peer_address}] Received twitchStart message");
 
-    if let Some(channel) = &twitch_start.channel_name {
-        info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
+    if let Some(channel_name) = &twitch_start.channel_name {
+        info!("[{peer_address}] Starting Twitch IRC connection for channel: {channel_name}");
         tokio::spawn(connect_twitch_irc(
             writer.clone(),
             assistant.clone(),
-            channel.clone(),
-            addr.to_string(),
+            channel_name.to_lowercase(),
+            peer_address.to_string(),
         ));
     }
 }
 
-async fn handle_response_message(addr: &str) {
-    debug!("[{addr}] Received response from streamer");
+async fn handle_response_message(peer_address: &str) {
+    debug!("[{peer_address}] Received response from streamer");
 }
 
 async fn is_identified(assistant: &Arc<Mutex<Assistant>>) -> bool {
@@ -472,12 +469,12 @@ async fn is_identified(assistant: &Arc<Mutex<Assistant>>) -> bool {
 async fn handle_websocket_ping(
     data: Vec<u8>,
     writer: &WsWriter,
-    addr: &str,
+    peer_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    debug!("[{addr}] Received WebSocket ping");
+    debug!("[{peer_address}] Received WebSocket ping");
     let mut write = writer.lock().await;
     write.send(Message::Pong(data)).await?;
-    debug!("[{addr}] Sent WebSocket pong");
+    debug!("[{peer_address}] Sent WebSocket pong");
     Ok(())
 }
 
@@ -485,19 +482,19 @@ async fn handle_streamer_connection(
     stream: tokio::net::TcpStream,
     assistant: Arc<Mutex<Assistant>>,
 ) {
-    let addr = stream
+    let peer_address = stream
         .peer_addr()
         .expect("Failed to get peer address")
         .to_string();
-    info!("[{addr}] New streamer connection");
+    info!("[{peer_address}] New streamer connection");
 
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => {
-            debug!("[{addr}] WebSocket handshake completed");
+            debug!("[{peer_address}] WebSocket handshake completed");
             ws
         }
         Err(e) => {
-            error!("[{addr}] Error during WebSocket handshake: {e}");
+            error!("[{peer_address}] Error during WebSocket handshake: {e}");
             return;
         }
     };
@@ -515,29 +512,29 @@ async fn handle_streamer_connection(
             ))
             .await
         {
-            error!("[{addr}] Error sending hello: {e}");
+            error!("[{peer_address}] Error sending hello: {e}");
             return;
         }
-        debug!("[{addr}] Sent hello message with authentication challenge");
+        debug!("[{peer_address}] Sent hello message with authentication challenge");
     }
 
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                error!("[{addr}] Error receiving message: {e}");
+                error!("[{peer_address}] Error receiving message: {e}");
                 break;
             }
         };
 
         match msg {
             Message::Text(text) => {
-                debug!("[{addr}] Received message: {text}");
+                debug!("[{peer_address}] Received message: {text}");
 
                 let incoming: IncomingMessage = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
-                        error!("[{addr}] Error parsing JSON: {e}");
+                        error!("[{peer_address}] Error parsing JSON: {e}");
                         continue;
                     }
                 };
@@ -545,15 +542,18 @@ async fn handle_streamer_connection(
                 match &incoming {
                     IncomingMessage::Identify(identify) => {
                         if let Err(e) =
-                            handle_identify_message(identify, &writer, &assistant, &addr).await
+                            handle_identify_message(identify, &writer, &assistant, &peer_address)
+                                .await
                         {
-                            error!("[{addr}] Error handling identify message: {e}");
+                            error!("[{peer_address}] Error handling identify message: {e}");
                             break;
                         }
                     }
                     IncomingMessage::Ping(_) => {
-                        if let Err(e) = handle_ping_message(&writer, &assistant, &addr).await {
-                            error!("[{addr}] Error handling ping message: {e}");
+                        if let Err(e) =
+                            handle_ping_message(&writer, &assistant, &peer_address).await
+                        {
+                            error!("[{peer_address}] Error handling ping message: {e}");
                             break;
                         }
                     }
@@ -561,39 +561,45 @@ async fn handle_streamer_connection(
                         if !is_identified(&assistant).await {
                             break;
                         }
-                        handle_event_message(&addr).await;
+                        handle_event_message(&peer_address).await;
                     }
                     IncomingMessage::TwitchStart(twitch_start) => {
                         if !is_identified(&assistant).await {
                             break;
                         }
-                        handle_twitch_start_message(twitch_start, &writer, &assistant, &addr).await;
+                        handle_twitch_start_message(
+                            twitch_start,
+                            &writer,
+                            &assistant,
+                            &peer_address,
+                        )
+                        .await;
                     }
                     IncomingMessage::Response(_) => {
                         if !is_identified(&assistant).await {
                             break;
                         }
-                        handle_response_message(&addr).await;
+                        handle_response_message(&peer_address).await;
                     }
                 }
             }
             Message::Ping(data) => {
-                if let Err(e) = handle_websocket_ping(data, &writer, &addr).await {
-                    error!("[{addr}] Error handling WebSocket ping: {e}");
+                if let Err(e) = handle_websocket_ping(data, &writer, &peer_address).await {
+                    error!("[{peer_address}] Error handling WebSocket ping: {e}");
                     break;
                 }
             }
             Message::Close(_) => {
-                debug!("[{addr}] Connection closed by streamer");
+                debug!("[{peer_address}] Connection closed by streamer");
                 break;
             }
             _ => {
-                debug!("[{addr}] Received unhandled message type");
+                debug!("[{peer_address}] Received unhandled message type");
             }
         }
     }
 
-    info!("[{addr}] Streamer disconnected");
+    info!("[{peer_address}] Streamer disconnected");
 }
 
 #[tokio::main]
