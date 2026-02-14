@@ -551,7 +551,11 @@ async fn youtube_get_initial_continuation(
         .await?;
 
     if !response.status().is_success() {
-        return Err(format!("YouTube live chat page returned status {}", response.status()).into());
+        return Err(format!(
+            "YouTube live chat page returned status {}",
+            response.status()
+        )
+        .into());
     }
 
     let body = response.text().await?;
@@ -585,7 +589,11 @@ async fn youtube_fetch_messages(
         .await?;
 
     if !response.status().is_success() {
-        return Err(format!("YouTube get_live_chat returned status {}", response.status()).into());
+        return Err(format!(
+            "YouTube get_live_chat returned status {}",
+            response.status()
+        )
+        .into());
     }
 
     let data: YtGetLiveChat = response.json().await?;
@@ -610,8 +618,10 @@ async fn connect_youtube_chat(
             }
             Err(e) => {
                 error!("[{peer_address}] YouTube chat error: {e}, reconnecting in {YOUTUBE_RECONNECT_DELAY_SECS}s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(YOUTUBE_RECONNECT_DELAY_SECS))
-                    .await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    YOUTUBE_RECONNECT_DELAY_SECS,
+                ))
+                .await;
             }
         }
     }
@@ -636,7 +646,11 @@ async fn youtube_chat_session(
 
         let mut message_count = 0;
 
-        if let Some(actions) = &live_chat.continuation_contents.live_chat_continuation.actions {
+        if let Some(actions) = &live_chat
+            .continuation_contents
+            .live_chat_continuation
+            .actions
+        {
             for action in actions {
                 let item = match &action.add_chat_item_action {
                     Some(a) => &a.item,
@@ -664,10 +678,10 @@ async fn youtube_chat_session(
                     let is_subscriber = is_youtube_member(chat_description);
                     let display_name = chat_description.author_name.simple_text.clone();
 
-                    let mut streamer_lock = streamer.lock().await;
-                    let chat_message_id = streamer_lock.next_chat_message_id();
-                    let request_id = streamer_lock.next_id();
-                    drop(streamer_lock);
+                    let mut streamer = streamer.lock().await;
+                    let chat_message_id = streamer.next_chat_message_id();
+                    let request_id = streamer.next_id();
+                    drop(streamer);
 
                     let chat_message = ChatMessage {
                         id: chat_message_id,
@@ -889,8 +903,6 @@ async fn handle_twitch_start_message(
     streamer: &Arc<Mutex<Streamer>>,
     peer_address: &str,
 ) {
-    debug!("[{peer_address}] Received twitchStart message");
-
     if let Some(channel_name) = &twitch_start.channel_name {
         info!("[{peer_address}] Starting Twitch IRC connection for channel: {channel_name}");
         tokio::spawn(connect_twitch_irc(
@@ -908,8 +920,6 @@ async fn handle_youtube_start_message(
     streamer: &Arc<Mutex<Streamer>>,
     peer_address: &str,
 ) {
-    debug!("[{peer_address}] Received youTubeStart message");
-
     info!(
         "[{peer_address}] Starting YouTube chat for video: {}",
         youtube_start.video_id
