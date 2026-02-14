@@ -147,7 +147,7 @@ enum IncomingMessage {
     Response(serde_json::Value),
 }
 
-struct Assistant {
+struct Streamer {
     password: String,
     challenge: String,
     salt: String,
@@ -156,7 +156,7 @@ struct Assistant {
     chat_message_id: i32,
 }
 
-impl Assistant {
+impl Streamer {
     fn new(password: String) -> Self {
         Self {
             password,
@@ -293,7 +293,7 @@ fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostS
 
 async fn connect_twitch_irc(
     writer: WsWriter,
-    assistant: Arc<Mutex<Assistant>>,
+    streamer: Arc<Mutex<Streamer>>,
     channel_name: String,
     peer_address: String,
 ) {
@@ -329,10 +329,10 @@ async fn connect_twitch_irc(
             let is_subscriber = message.badges.iter().any(|b| b.name == "subscriber");
             let is_owner = message.badges.iter().any(|b| b.name == "broadcaster");
 
-            let mut assistant = assistant.lock().await;
-            let chat_message_id = assistant.next_chat_message_id();
-            let request_id = assistant.next_id();
-            drop(assistant);
+            let mut streamer = streamer.lock().await;
+            let chat_message_id = streamer.next_chat_message_id();
+            let request_id = streamer.next_id();
+            drop(streamer);
 
             let chat_message = ChatMessage {
                 id: chat_message_id,
@@ -362,8 +362,8 @@ async fn connect_twitch_irc(
 
             if let Ok(encoded) = serde_json::to_string(&request) {
                 debug!("[{peer_address}] Forwarding Twitch chat message: {encoded}");
-                let mut write = writer.lock().await;
-                if let Err(e) = write.send(Message::Text(encoded)).await {
+                let mut writer = writer.lock().await;
+                if let Err(e) = writer.send(Message::Text(encoded)).await {
                     error!("[{peer_address}] Error forwarding chat message: {e}");
                     return;
                 }
@@ -377,18 +377,18 @@ async fn connect_twitch_irc(
 async fn handle_identify_message(
     identify: &IdentifyData,
     writer: &WsWriter,
-    assistant: &Arc<Mutex<Assistant>>,
+    streamer: &Arc<Mutex<Streamer>>,
     peer_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     debug!("[{peer_address}] Processing identify message");
-    let mut assistant = assistant.lock().await;
-    let expected_hash = assistant.hash_password();
+    let mut streamer = streamer.lock().await;
+    let expected_hash = streamer.hash_password();
 
-    let result = if assistant.identified {
+    let result = if streamer.identified {
         debug!("[{peer_address}] Streamer already identified");
         IdentifiedResult::AlreadyIdentified {}
     } else if identify.authentication == expected_hash {
-        assistant.identified = true;
+        streamer.identified = true;
         info!("[{peer_address}] Streamer successfully identified");
         IdentifiedResult::Ok {}
     } else {
@@ -396,18 +396,18 @@ async fn handle_identify_message(
         IdentifiedResult::WrongPassword {}
     };
 
-    let response = assistant.create_identified_message(result);
-    let is_identified = assistant.identified;
-    drop(assistant);
+    let response = streamer.create_identified_message(result);
+    let is_identified = streamer.identified;
+    drop(streamer);
 
-    let mut write = writer.lock().await;
-    write
+    let mut writer = writer.lock().await;
+    writer
         .send(Message::Text(
             serde_json::to_string(&response).expect("Failed to serialize identified response"),
         ))
         .await?;
     debug!("[{peer_address}] Sent identified response");
-    drop(write);
+    drop(writer);
 
     // If identified successfully, start processing Twitch messages
     if is_identified {
@@ -418,15 +418,15 @@ async fn handle_identify_message(
 
 async fn handle_ping_message(
     writer: &WsWriter,
-    assistant: &Arc<Mutex<Assistant>>,
+    streamer: &Arc<Mutex<Streamer>>,
     peer_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let assistant = assistant.lock().await;
-    let pong = assistant.create_pong_message();
-    drop(assistant);
+    let streamer = streamer.lock().await;
+    let pong = streamer.create_pong_message();
+    drop(streamer);
 
-    let mut write = writer.lock().await;
-    write
+    let mut writer = writer.lock().await;
+    writer
         .send(Message::Text(
             serde_json::to_string(&pong).expect("Failed to serialize pong message"),
         ))
@@ -442,7 +442,7 @@ async fn handle_event_message(peer_address: &str) {
 async fn handle_twitch_start_message(
     twitch_start: &TwitchStartData,
     writer: &WsWriter,
-    assistant: &Arc<Mutex<Assistant>>,
+    streamer: &Arc<Mutex<Streamer>>,
     peer_address: &str,
 ) {
     debug!("[{peer_address}] Received twitchStart message");
@@ -451,7 +451,7 @@ async fn handle_twitch_start_message(
         info!("[{peer_address}] Starting Twitch IRC connection for channel: {channel_name}");
         tokio::spawn(connect_twitch_irc(
             writer.clone(),
-            assistant.clone(),
+            streamer.clone(),
             channel_name.to_lowercase(),
             peer_address.to_string(),
         ));
@@ -462,8 +462,8 @@ async fn handle_response_message(peer_address: &str) {
     debug!("[{peer_address}] Received response from streamer");
 }
 
-async fn is_identified(assistant: &Arc<Mutex<Assistant>>) -> bool {
-    assistant.lock().await.identified
+async fn is_identified(streamer: &Arc<Mutex<Streamer>>) -> bool {
+    streamer.lock().await.identified
 }
 
 async fn handle_websocket_ping(
@@ -472,16 +472,13 @@ async fn handle_websocket_ping(
     peer_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     debug!("[{peer_address}] Received WebSocket ping");
-    let mut write = writer.lock().await;
-    write.send(Message::Pong(data)).await?;
+    let mut writer = writer.lock().await;
+    writer.send(Message::Pong(data)).await?;
     debug!("[{peer_address}] Sent WebSocket pong");
     Ok(())
 }
 
-async fn handle_streamer_connection(
-    stream: tokio::net::TcpStream,
-    assistant: Arc<Mutex<Assistant>>,
-) {
+async fn handle_streamer_connection(stream: tokio::net::TcpStream, streamer: Arc<Mutex<Streamer>>) {
     let peer_address = stream
         .peer_addr()
         .expect("Failed to get peer address")
@@ -503,10 +500,10 @@ async fn handle_streamer_connection(
     let writer: WsWriter = Arc::new(Mutex::new(write));
 
     {
-        let assistant = assistant.lock().await;
-        let hello = assistant.create_hello_message();
-        let mut write = writer.lock().await;
-        if let Err(e) = write
+        let streamer = streamer.lock().await;
+        let hello = streamer.create_hello_message();
+        let mut writer = writer.lock().await;
+        if let Err(e) = writer
             .send(Message::Text(
                 serde_json::to_string(&hello).expect("Failed to serialize hello message"),
             ))
@@ -542,7 +539,7 @@ async fn handle_streamer_connection(
                 match &incoming {
                     IncomingMessage::Identify(identify) => {
                         if let Err(e) =
-                            handle_identify_message(identify, &writer, &assistant, &peer_address)
+                            handle_identify_message(identify, &writer, &streamer, &peer_address)
                                 .await
                         {
                             error!("[{peer_address}] Error handling identify message: {e}");
@@ -550,33 +547,32 @@ async fn handle_streamer_connection(
                         }
                     }
                     IncomingMessage::Ping(_) => {
-                        if let Err(e) =
-                            handle_ping_message(&writer, &assistant, &peer_address).await
+                        if let Err(e) = handle_ping_message(&writer, &streamer, &peer_address).await
                         {
                             error!("[{peer_address}] Error handling ping message: {e}");
                             break;
                         }
                     }
                     IncomingMessage::Event(_) => {
-                        if !is_identified(&assistant).await {
+                        if !is_identified(&streamer).await {
                             break;
                         }
                         handle_event_message(&peer_address).await;
                     }
                     IncomingMessage::TwitchStart(twitch_start) => {
-                        if !is_identified(&assistant).await {
+                        if !is_identified(&streamer).await {
                             break;
                         }
                         handle_twitch_start_message(
                             twitch_start,
                             &writer,
-                            &assistant,
+                            &streamer,
                             &peer_address,
                         )
                         .await;
                     }
                     IncomingMessage::Response(_) => {
-                        if !is_identified(&assistant).await {
+                        if !is_identified(&streamer).await {
                             break;
                         }
                         handle_response_message(&peer_address).await;
@@ -622,8 +618,8 @@ async fn main() {
             .await
             .expect("Failed to accept connection");
         debug!("Accepted TCP connection from {addr}");
-        let assistant = Arc::new(Mutex::new(Assistant::new(args.password.clone())));
-        tokio::spawn(handle_streamer_connection(stream, assistant));
+        let streamer = Arc::new(Mutex::new(Streamer::new(args.password.clone())));
+        tokio::spawn(handle_streamer_connection(stream, streamer));
     }
 }
 
