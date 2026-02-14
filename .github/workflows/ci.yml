@@ -49,25 +49,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Read package version
-        id: package_version
-        run: |
-          version=$(awk -F'\"' '/^\[package\]/{in_package=1;next} /^\[/{in_package=0} in_package && /^[[:space:]]*version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
-          if [ -z "$version" ]; then
-            echo "Failed to read version from Cargo.toml" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Prepare release assets
         env:
-          VERSION: ${{ steps.package_version.outputs.version }}
+          VERSION: ${{ github.ref_name }}
         run: |
           cd artifacts
           for dir in moblin-assistant-*; do
