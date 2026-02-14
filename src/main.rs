@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use twitch_irc::login::StaticLoginCredentials;
-use twitch_irc::message::ServerMessage;
+use twitch_irc::message::{Emote, ServerMessage};
 use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 const API_VERSION: &str = "0.1";
@@ -241,6 +241,69 @@ fn decrypt_access_token(password: &str, encrypted_base64: &str) -> Option<String
     }
 }
 
+fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostSegment> {
+    let mut segments: Vec<ChatPostSegment> = Vec::new();
+    let mut id: i32 = 0;
+    let chars: Vec<char> = message_text.chars().collect();
+    let mut sorted_emotes: Vec<&Emote> = emotes.iter().collect();
+    sorted_emotes.sort_by_key(|e| e.char_range.start);
+    let mut start_index: usize = 0;
+    for emote in &sorted_emotes {
+        if emote.char_range.start >= chars.len() {
+            break;
+        }
+        let emote_end = emote.char_range.end.min(chars.len());
+        if emote.char_range.start > start_index {
+            let text_before: String = chars[start_index..emote.char_range.start].iter().collect();
+            for word in text_before.split_whitespace() {
+                segments.push(ChatPostSegment {
+                    id,
+                    text: Some(format!("{} ", word)),
+                    url: None,
+                });
+                id += 1;
+            }
+        }
+        let emote_url = format!(
+            "https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/3.0",
+            emote.id
+        );
+        segments.push(ChatPostSegment {
+            id,
+            text: None,
+            url: Some(emote_url),
+        });
+        id += 1;
+        // Empty text spacer segment after emote, matching Moblin's protocol
+        segments.push(ChatPostSegment {
+            id,
+            text: Some(String::new()),
+            url: None,
+        });
+        id += 1;
+        start_index = emote_end;
+    }
+    if start_index < chars.len() {
+        let remaining: String = chars[start_index..].iter().collect();
+        for word in remaining.split_whitespace() {
+            segments.push(ChatPostSegment {
+                id,
+                text: Some(format!("{} ", word)),
+                url: None,
+            });
+            id += 1;
+        }
+    }
+    if segments.is_empty() {
+        segments.push(ChatPostSegment {
+            id,
+            text: Some(message_text.to_string()),
+            url: None,
+        });
+    }
+    segments
+}
+
 async fn connect_twitch_irc(
     writer: WsWriter,
     assistant: Arc<Mutex<Assistant>>,
@@ -297,11 +360,7 @@ async fn connect_twitch_irc(
                 user_id: Some(msg.sender.id.clone()),
                 user_color,
                 user_badges,
-                segments: vec![ChatPostSegment {
-                    id: 0,
-                    text: Some(msg.message_text.clone()),
-                    url: None,
-                }],
+                segments: create_twitch_segments(&msg.message_text, &msg.emotes),
                 timestamp: msg.server_timestamp.to_rfc3339(),
                 is_action: msg.is_action,
                 is_moderator,
@@ -577,5 +636,148 @@ async fn main() {
         );
         let assistant = Arc::new(Mutex::new(Assistant::new(args.password.clone())));
         tokio::spawn(handle_streamer_connection(stream, assistant));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use twitch_irc::message::Emote;
+
+    #[test]
+    fn test_no_emotes() {
+        let segments = create_twitch_segments("hello world", &[]);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text.as_deref(), Some("hello "));
+        assert!(segments[0].url.is_none());
+        assert_eq!(segments[1].text.as_deref(), Some("world "));
+        assert!(segments[1].url.is_none());
+    }
+
+    #[test]
+    fn test_single_emote_only() {
+        let emotes = vec![Emote {
+            id: "25".to_string(),
+            char_range: 0..5,
+            code: "Kappa".to_string(),
+        }];
+        let segments = create_twitch_segments("Kappa", &emotes);
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].text.is_none());
+        assert_eq!(
+            segments[0].url.as_deref(),
+            Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0")
+        );
+        assert_eq!(segments[1].text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_text_before_and_after_emote() {
+        let emotes = vec![Emote {
+            id: "25".to_string(),
+            char_range: 6..11,
+            code: "Kappa".to_string(),
+        }];
+        let segments = create_twitch_segments("hello Kappa world", &emotes);
+        // "hello " -> text, Kappa -> url + spacer, " world" -> text
+        assert_eq!(segments.len(), 4);
+        assert_eq!(segments[0].text.as_deref(), Some("hello "));
+        assert!(segments[1].url.is_some());
+        assert_eq!(segments[2].text.as_deref(), Some(""));
+        assert_eq!(segments[3].text.as_deref(), Some("world "));
+    }
+
+    #[test]
+    fn test_multiple_emotes() {
+        // "Kappa Keepo Kappa"
+        let emotes = vec![
+            Emote {
+                id: "25".to_string(),
+                char_range: 0..5,
+                code: "Kappa".to_string(),
+            },
+            Emote {
+                id: "1902".to_string(),
+                char_range: 6..11,
+                code: "Keepo".to_string(),
+            },
+            Emote {
+                id: "25".to_string(),
+                char_range: 12..17,
+                code: "Kappa".to_string(),
+            },
+        ];
+        let segments = create_twitch_segments("Kappa Keepo Kappa", &emotes);
+        assert_eq!(segments[0].url.as_deref(), Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0"));
+        assert_eq!(segments[2].url.as_deref(), Some("https://static-cdn.jtvnw.net/emoticons/v2/1902/default/dark/3.0"));
+        assert_eq!(segments[4].url.as_deref(), Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0"));
+    }
+
+    #[test]
+    fn test_emote_with_unicode() {
+        // "👉 <3 test" - emoji is one char, then space, then <3 emote
+        let emotes = vec![Emote {
+            id: "483".to_string(),
+            char_range: 2..4,
+            code: "<3".to_string(),
+        }];
+        let segments = create_twitch_segments("👉 <3 test", &emotes);
+        assert_eq!(segments[0].text.as_deref(), Some("👉 "));
+        assert!(segments[1].url.is_some());
+        assert_eq!(segments[2].text.as_deref(), Some(""));
+        assert_eq!(segments[3].text.as_deref(), Some("test "));
+    }
+
+    #[test]
+    fn test_empty_message() {
+        let segments = create_twitch_segments("", &[]);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_emote_with_non_numeric_id() {
+        let emotes = vec![Emote {
+            id: "300196486_TK".to_string(),
+            char_range: 0..8,
+            code: "pajaM_TK".to_string(),
+        }];
+        let segments = create_twitch_segments("pajaM_TK", &emotes);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments[0].url.as_deref(),
+            Some("https://static-cdn.jtvnw.net/emoticons/v2/300196486_TK/default/dark/3.0")
+        );
+    }
+
+    #[test]
+    fn test_mixed_text_and_emotes() {
+        let emotes = vec![
+            Emote {
+                id: "25".to_string(),
+                char_range: 0..5,
+                code: "Kappa".to_string(),
+            },
+            Emote {
+                id: "1902".to_string(),
+                char_range: 6..11,
+                code: "Keepo".to_string(),
+            },
+            Emote {
+                id: "25".to_string(),
+                char_range: 12..17,
+                code: "Kappa".to_string(),
+            },
+            Emote {
+                id: "25".to_string(),
+                char_range: 18..23,
+                code: "Kappa".to_string(),
+            },
+        ];
+        let segments = create_twitch_segments("Kappa Keepo Kappa Kappa test", &emotes);
+        let url_count = segments.iter().filter(|s| s.url.is_some()).count();
+        assert_eq!(url_count, 4);
+        let last = segments.last().unwrap();
+        assert_eq!(last.text.as_deref(), Some("test "));
     }
 }
