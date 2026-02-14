@@ -3,7 +3,6 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -147,6 +146,18 @@ enum IncomingMessage {
     Response(serde_json::Value),
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PongMessage {}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum OutgoingMessage {
+    Hello(HelloMessage),
+    Identified(IdentifiedMessage),
+    Pong(PongMessage),
+    Request(RequestMessage),
+}
+
 struct Streamer {
     password: String,
     challenge: String,
@@ -192,24 +203,22 @@ impl Streamer {
         self.chat_message_id
     }
 
-    fn create_hello_message(&self) -> HelloMessage {
-        HelloMessage {
+    fn create_hello_message(&self) -> OutgoingMessage {
+        OutgoingMessage::Hello(HelloMessage {
             api_version: API_VERSION.to_string(),
             authentication: Authentication {
                 challenge: self.challenge.clone(),
                 salt: self.salt.clone(),
             },
-        }
-    }
-
-    fn create_identified_message(&self, result: IdentifiedResult) -> IdentifiedMessage {
-        IdentifiedMessage { result }
-    }
-
-    fn create_pong_message(&self) -> serde_json::Value {
-        json!({
-            "pong": {}
         })
+    }
+
+    fn create_identified_message(&self, result: IdentifiedResult) -> OutgoingMessage {
+        OutgoingMessage::Identified(IdentifiedMessage { result })
+    }
+
+    fn create_pong_message(&self) -> OutgoingMessage {
+        OutgoingMessage::Pong(PongMessage {})
     }
 }
 
@@ -352,13 +361,13 @@ async fn connect_twitch_irc(
                 bits: message.bits.map(|b| b.to_string()),
             };
 
-            let request = RequestMessage {
+            let request = OutgoingMessage::Request(RequestMessage {
                 id: request_id,
                 data: RequestData::ChatMessages(ChatMessagesRequest {
                     history: false,
                     messages: vec![chat_message],
                 }),
-            };
+            });
 
             if let Ok(encoded) = serde_json::to_string(&request) {
                 debug!("[{peer_address}] Forwarding Twitch chat message: {encoded}");
@@ -396,14 +405,14 @@ async fn handle_identify_message(
         IdentifiedResult::WrongPassword {}
     };
 
-    let response = streamer.create_identified_message(result);
+    let identified = streamer.create_identified_message(result);
     let is_identified = streamer.identified;
     drop(streamer);
 
     let mut writer = writer.lock().await;
     writer
         .send(Message::Text(
-            serde_json::to_string(&response).expect("Failed to serialize identified response"),
+            serde_json::to_string(&identified).expect("Failed to serialize identified response"),
         ))
         .await?;
     debug!("[{peer_address}] Sent identified response");
