@@ -259,7 +259,10 @@ async fn send_delayed_chat_messages(
             log(&addr, &format!("Sending chat message: {}", msg_str));
             let mut write = writer.lock().await;
             if let Err(e) = write.send(Message::Text(msg_str)).await {
-                log_error(&addr, &format!("Error sending chat message: {}", e));
+                log_error(
+                    &addr,
+                    &format!("Error sending chat message, aborting delayed messages: {}", e),
+                );
                 return;
             }
         }
