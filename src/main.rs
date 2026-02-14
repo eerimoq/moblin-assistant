@@ -188,7 +188,6 @@ impl Assistant {
             "pong": {}
         })
     }
-
 }
 
 fn random_string() -> String {
@@ -251,7 +250,7 @@ fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostS
             for word in text_before.split_whitespace() {
                 segments.push(ChatPostSegment {
                     id,
-                    text: Some(format!("{} ", word)),
+                    text: Some(format!("{word} ")),
                     url: None,
                 });
                 id += 1;
@@ -281,7 +280,7 @@ fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostS
         for word in remaining.split_whitespace() {
             segments.push(ChatPostSegment {
                 id,
-                text: Some(format!("{} ", word)),
+                text: Some(format!("{word} ")),
                 url: None,
             });
             id += 1;
@@ -304,7 +303,7 @@ async fn connect_twitch_irc(
     _access_token: String,
     addr: String,
 ) {
-    info!("[{}] Connecting to Twitch IRC for channel: {}", addr, channel_name);
+    info!("[{addr}] Connecting to Twitch IRC for channel: {channel_name}");
 
     // Use anonymous credentials since we only need to read chat messages
     let credentials = StaticLoginCredentials::anonymous();
@@ -315,11 +314,11 @@ async fn connect_twitch_irc(
     // twitch-irc crate expects channel names without '#' prefix, in lowercase
     let channel = channel_name.trim_start_matches('#').to_lowercase();
     if let Err(e) = client.join(channel.clone()) {
-        error!("[{}] Failed to join Twitch channel '{}': {}", addr, channel, e);
+        error!("[{addr}] Failed to join Twitch channel '{channel}': {e}");
         return;
     }
 
-    info!("[{}] Joined Twitch channel #{}", addr, channel);
+    info!("[{addr}] Joined Twitch channel #{channel}");
 
     while let Some(message) = incoming_messages.recv().await {
         if let ServerMessage::Privmsg(msg) = message {
@@ -375,17 +374,17 @@ async fn connect_twitch_irc(
             });
 
             if let Ok(msg_str) = serde_json::to_string(&chat_request) {
-                debug!("[{}] Forwarding Twitch chat message: {}", addr, msg_str);
+                debug!("[{addr}] Forwarding Twitch chat message: {msg_str}");
                 let mut write = writer.lock().await;
                 if let Err(e) = write.send(Message::Text(msg_str)).await {
-                    error!("[{}] Error forwarding chat message: {}", addr, e);
+                    error!("[{addr}] Error forwarding chat message: {e}");
                     return;
                 }
             }
         }
     }
 
-    debug!("[{}] Twitch IRC connection ended", addr);
+    debug!("[{addr}] Twitch IRC connection ended");
 }
 
 async fn handle_streamer_connection(
@@ -396,15 +395,15 @@ async fn handle_streamer_connection(
         .peer_addr()
         .expect("Failed to get peer address")
         .to_string();
-    info!("[{}] New streamer connection", addr);
+    info!("[{addr}] New streamer connection");
 
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => {
-            debug!("[{}] WebSocket handshake completed", addr);
+            debug!("[{addr}] WebSocket handshake completed");
             ws
         }
         Err(e) => {
-            error!("[{}] Error during WebSocket handshake: {}", addr, e);
+            error!("[{addr}] Error during WebSocket handshake: {e}");
             return;
         }
     };
@@ -423,10 +422,10 @@ async fn handle_streamer_connection(
             ))
             .await
         {
-            error!("[{}] Error sending hello: {}", addr, e);
+            error!("[{addr}] Error sending hello: {e}");
             return;
         }
-        debug!("[{}] Sent hello message with authentication challenge", addr);
+        debug!("[{addr}] Sent hello message with authentication challenge");
     }
 
     // Handle incoming messages
@@ -434,41 +433,39 @@ async fn handle_streamer_connection(
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                error!("[{}] Error receiving message: {}", addr, e);
+                error!("[{addr}] Error receiving message: {e}");
                 break;
             }
         };
 
         match msg {
             Message::Text(text) => {
-                debug!("[{}] Received message: {}", addr, text);
+                debug!("[{addr}] Received message: {text}");
 
                 let json_msg: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
-                        error!("[{}] Error parsing JSON: {}", addr, e);
+                        error!("[{addr}] Error parsing JSON: {e}");
                         continue;
                     }
                 };
 
                 // Handle identify message
                 if let Some(identify) = json_msg.get("identify") {
-                    debug!("[{}] Processing identify message", addr);
-                    if let Some(auth) =
-                        identify.get("authentication").and_then(|a| a.as_str())
-                    {
+                    debug!("[{addr}] Processing identify message");
+                    if let Some(auth) = identify.get("authentication").and_then(|a| a.as_str()) {
                         let mut assistant_locked = assistant.lock().await;
                         let expected_hash = assistant_locked.hash_password();
 
                         let result = if assistant_locked.identified {
-                            debug!("[{}] Streamer already identified", addr);
+                            debug!("[{addr}] Streamer already identified");
                             IdentifiedResult::AlreadyIdentified {}
                         } else if auth == expected_hash {
                             assistant_locked.identified = true;
-                            info!("[{}] Streamer successfully identified", addr);
+                            info!("[{addr}] Streamer successfully identified");
                             IdentifiedResult::Ok {}
                         } else {
-                            error!("[{}] Wrong password from streamer", addr);
+                            error!("[{addr}] Wrong password from streamer");
                             IdentifiedResult::WrongPassword {}
                         };
 
@@ -477,24 +474,25 @@ async fn handle_streamer_connection(
                         drop(assistant_locked);
 
                         let mut write = writer.lock().await;
-                        if let Err(e) = write.send(Message::Text(
-                            serde_json::to_string(&response)
-                                .expect("Failed to serialize identified response"),
-                        ))
-                        .await
+                        if let Err(e) = write
+                            .send(Message::Text(
+                                serde_json::to_string(&response)
+                                    .expect("Failed to serialize identified response"),
+                            ))
+                            .await
                         {
-                            error!("[{}] Error sending identified: {}", addr, e);
+                            error!("[{addr}] Error sending identified: {e}");
                             break;
                         }
-                        debug!("[{}] Sent identified response", addr);
+                        debug!("[{addr}] Sent identified response");
                         drop(write);
 
                         // If identified successfully, start processing Twitch messages
                         if is_identified {
-                            debug!("[{}] Streamer identified, waiting for twitchStart message", addr);
+                            debug!("[{addr}] Streamer identified, waiting for twitchStart message");
                         }
                     } else {
-                        error!("[{}] Identify message missing authentication field", addr);
+                        error!("[{addr}] Identify message missing authentication field");
                     }
                 }
 
@@ -507,25 +505,24 @@ async fn handle_streamer_connection(
                     let mut write = writer.lock().await;
                     if let Err(e) = write
                         .send(Message::Text(
-                            serde_json::to_string(&pong)
-                                .expect("Failed to serialize pong message"),
+                            serde_json::to_string(&pong).expect("Failed to serialize pong message"),
                         ))
                         .await
                     {
-                        error!("[{}] Error sending pong: {}", addr, e);
+                        error!("[{addr}] Error sending pong: {e}");
                         break;
                     }
-                    debug!("[{}] Sent pong response", addr);
+                    debug!("[{addr}] Sent pong response");
                 }
 
                 // Handle event messages
                 if json_msg.get("event").is_some() {
-                    debug!("[{}] Received event from streamer", addr);
+                    debug!("[{addr}] Received event from streamer");
                 }
 
                 // Handle twitchStart message
                 if let Some(twitch_start) = json_msg.get("twitchStart") {
-                    debug!("[{}] Received twitchStart message", addr);
+                    debug!("[{addr}] Received twitchStart message");
                     let channel_name = twitch_start
                         .get("channelName")
                         .and_then(|v| v.as_str())
@@ -539,8 +536,7 @@ async fn handle_streamer_connection(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
-                    if let (Some(encrypted_token), Some(channel_id)) =
-                        (encrypted_token, channel_id)
+                    if let (Some(encrypted_token), Some(channel_id)) = (encrypted_token, channel_id)
                     {
                         let assistant_locked = assistant.lock().await;
                         let password = assistant_locked.password.clone();
@@ -551,10 +547,7 @@ async fn handle_streamer_connection(
                         {
                             // Use channel_name if provided, otherwise use the channel_id
                             let channel = channel_name.unwrap_or_else(|| channel_id.clone());
-                            info!(
-                                "[{}] Starting Twitch IRC connection for channel: {}",
-                                addr, channel
-                            );
+                            info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
                             tokio::spawn(connect_twitch_irc(
                                 writer.clone(),
                                 assistant.clone(),
@@ -563,41 +556,38 @@ async fn handle_streamer_connection(
                                 addr.clone(),
                             ));
                         } else {
-                            error!("[{}] Failed to decrypt Twitch access token", addr);
+                            error!("[{addr}] Failed to decrypt Twitch access token");
                         }
                     } else {
-                        error!(
-                            "[{}] twitchStart message missing channelId or accessToken",
-                            addr
-                        );
+                        error!("[{addr}] twitchStart message missing channelId or accessToken");
                     }
                 }
 
                 // Handle response messages
                 if json_msg.get("response").is_some() {
-                    debug!("[{}] Received response from streamer", addr);
+                    debug!("[{addr}] Received response from streamer");
                 }
             }
             Message::Ping(data) => {
-                debug!("[{}] Received WebSocket ping", addr);
+                debug!("[{addr}] Received WebSocket ping");
                 let mut write = writer.lock().await;
                 if let Err(e) = write.send(Message::Pong(data)).await {
-                    error!("[{}] Error sending WebSocket pong: {}", addr, e);
+                    error!("[{addr}] Error sending WebSocket pong: {e}");
                     break;
                 }
-                debug!("[{}] Sent WebSocket pong", addr);
+                debug!("[{addr}] Sent WebSocket pong");
             }
             Message::Close(_) => {
-                debug!("[{}] Connection closed by streamer", addr);
+                debug!("[{addr}] Connection closed by streamer");
                 break;
             }
             _ => {
-                debug!("[{}] Received unhandled message type", addr);
+                debug!("[{addr}] Received unhandled message type");
             }
         }
     }
 
-    info!("[{}] Streamer disconnected", addr);
+    info!("[{addr}] Streamer disconnected");
 }
 
 #[tokio::main]
@@ -606,26 +596,20 @@ async fn main() {
 
     let args = Args::parse();
 
-    info!(
-        "Starting Moblin Assistant server on port {}",
-        args.port
-    );
+    info!("Starting Moblin Assistant server on port {}", args.port);
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", args.port))
         .await
         .expect("Failed to bind");
 
-    info!(
-        "Server listening on 0.0.0.0:{}",
-        args.port
-    );
+    info!("Server listening on 0.0.0.0:{}", args.port);
 
     loop {
-        let (stream, addr) = listener.accept().await.expect("Failed to accept connection");
-        debug!(
-            "Accepted TCP connection from {}",
-            addr
-        );
+        let (stream, addr) = listener
+            .accept()
+            .await
+            .expect("Failed to accept connection");
+        debug!("Accepted TCP connection from {addr}");
         let assistant = Arc::new(Mutex::new(Assistant::new(args.password.clone())));
         tokio::spawn(handle_streamer_connection(stream, assistant));
     }
@@ -700,9 +684,18 @@ mod tests {
             },
         ];
         let segments = create_twitch_segments("Kappa Keepo Kappa", &emotes);
-        assert_eq!(segments[0].url.as_deref(), Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0"));
-        assert_eq!(segments[2].url.as_deref(), Some("https://static-cdn.jtvnw.net/emoticons/v2/1902/default/dark/3.0"));
-        assert_eq!(segments[4].url.as_deref(), Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0"));
+        assert_eq!(
+            segments[0].url.as_deref(),
+            Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0")
+        );
+        assert_eq!(
+            segments[2].url.as_deref(),
+            Some("https://static-cdn.jtvnw.net/emoticons/v2/1902/default/dark/3.0")
+        );
+        assert_eq!(
+            segments[4].url.as_deref(),
+            Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0")
+        );
     }
 
     #[test]
