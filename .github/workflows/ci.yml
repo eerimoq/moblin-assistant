@@ -54,16 +54,18 @@ jobs:
           path: artifacts
 
       - name: Prepare release assets
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           cd artifacts
           for dir in moblin-assistant-*; do
             target="${dir#moblin-assistant-}"
             cd "$dir"
             if [ -f moblin-assistant.exe ]; then
-              zip "../../moblin-assistant-${target}.zip" moblin-assistant.exe
+              zip "../../moblin-assistant-${VERSION}-${target}.zip" moblin-assistant.exe
             else
               chmod +x moblin-assistant
-              tar czf "../../moblin-assistant-${target}.tar.gz" moblin-assistant
+              tar czf "../../moblin-assistant-${VERSION}-${target}.tar.gz" moblin-assistant
             fi
             cd ..
           done
