@@ -603,7 +603,7 @@ async fn handle_streamer_connection(
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    
+
     let args = Args::parse();
 
     info!(
