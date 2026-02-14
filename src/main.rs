@@ -387,6 +387,136 @@ async fn connect_twitch_irc(
     debug!("[{addr}] Twitch IRC connection ended");
 }
 
+async fn handle_identify_message(
+    identify: &serde_json::Value,
+    writer: &WsWriter,
+    assistant: &Arc<Mutex<Assistant>>,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    debug!("[{addr}] Processing identify message");
+    if let Some(auth) = identify.get("authentication").and_then(|a| a.as_str()) {
+        let mut assistant_locked = assistant.lock().await;
+        let expected_hash = assistant_locked.hash_password();
+
+        let result = if assistant_locked.identified {
+            debug!("[{addr}] Streamer already identified");
+            IdentifiedResult::AlreadyIdentified {}
+        } else if auth == expected_hash {
+            assistant_locked.identified = true;
+            info!("[{addr}] Streamer successfully identified");
+            IdentifiedResult::Ok {}
+        } else {
+            error!("[{addr}] Wrong password from streamer");
+            IdentifiedResult::WrongPassword {}
+        };
+
+        let response = assistant_locked.create_identified_message(result);
+        let is_identified = assistant_locked.identified;
+        drop(assistant_locked);
+
+        let mut write = writer.lock().await;
+        write
+            .send(Message::Text(
+                serde_json::to_string(&response)
+                    .expect("Failed to serialize identified response"),
+            ))
+            .await?;
+        debug!("[{addr}] Sent identified response");
+        drop(write);
+
+        // If identified successfully, start processing Twitch messages
+        if is_identified {
+            debug!("[{addr}] Streamer identified, waiting for twitchStart message");
+        }
+    } else {
+        error!("[{addr}] Identify message missing authentication field");
+    }
+    Ok(())
+}
+
+async fn handle_ping_message(
+    writer: &WsWriter,
+    assistant: &Arc<Mutex<Assistant>>,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let assistant_locked = assistant.lock().await;
+    let pong = assistant_locked.create_pong_message();
+    drop(assistant_locked);
+
+    let mut write = writer.lock().await;
+    write
+        .send(Message::Text(
+            serde_json::to_string(&pong).expect("Failed to serialize pong message"),
+        ))
+        .await?;
+    debug!("[{addr}] Sent pong response");
+    Ok(())
+}
+
+async fn handle_event_message(addr: &str) {
+    debug!("[{addr}] Received event from streamer");
+}
+
+async fn handle_twitch_start_message(
+    twitch_start: &serde_json::Value,
+    writer: &WsWriter,
+    assistant: &Arc<Mutex<Assistant>>,
+    addr: &str,
+) {
+    debug!("[{addr}] Received twitchStart message");
+    let channel_name = twitch_start
+        .get("channelName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let channel_id = twitch_start
+        .get("channelId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let encrypted_token = twitch_start
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if let (Some(encrypted_token), Some(channel_id)) = (encrypted_token, channel_id) {
+        let assistant_locked = assistant.lock().await;
+        let password = assistant_locked.password.clone();
+        drop(assistant_locked);
+
+        if let Some(access_token) = decrypt_access_token(&password, &encrypted_token) {
+            // Use channel_name if provided, otherwise use the channel_id
+            let channel = channel_name.unwrap_or_else(|| channel_id.clone());
+            info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
+            tokio::spawn(connect_twitch_irc(
+                writer.clone(),
+                assistant.clone(),
+                channel,
+                access_token,
+                addr.to_string(),
+            ));
+        } else {
+            error!("[{addr}] Failed to decrypt Twitch access token");
+        }
+    } else {
+        error!("[{addr}] twitchStart message missing channelId or accessToken");
+    }
+}
+
+async fn handle_response_message(addr: &str) {
+    debug!("[{addr}] Received response from streamer");
+}
+
+async fn handle_websocket_ping(
+    data: Vec<u8>,
+    writer: &WsWriter,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    debug!("[{addr}] Received WebSocket ping");
+    let mut write = writer.lock().await;
+    write.send(Message::Pong(data)).await?;
+    debug!("[{addr}] Sent WebSocket pong");
+    Ok(())
+}
+
 async fn handle_streamer_connection(
     stream: tokio::net::TcpStream,
     assistant: Arc<Mutex<Assistant>>,
@@ -452,130 +582,40 @@ async fn handle_streamer_connection(
 
                 // Handle identify message
                 if let Some(identify) = json_msg.get("identify") {
-                    debug!("[{addr}] Processing identify message");
-                    if let Some(auth) = identify.get("authentication").and_then(|a| a.as_str()) {
-                        let mut assistant_locked = assistant.lock().await;
-                        let expected_hash = assistant_locked.hash_password();
-
-                        let result = if assistant_locked.identified {
-                            debug!("[{addr}] Streamer already identified");
-                            IdentifiedResult::AlreadyIdentified {}
-                        } else if auth == expected_hash {
-                            assistant_locked.identified = true;
-                            info!("[{addr}] Streamer successfully identified");
-                            IdentifiedResult::Ok {}
-                        } else {
-                            error!("[{addr}] Wrong password from streamer");
-                            IdentifiedResult::WrongPassword {}
-                        };
-
-                        let response = assistant_locked.create_identified_message(result);
-                        let is_identified = assistant_locked.identified;
-                        drop(assistant_locked);
-
-                        let mut write = writer.lock().await;
-                        if let Err(e) = write
-                            .send(Message::Text(
-                                serde_json::to_string(&response)
-                                    .expect("Failed to serialize identified response"),
-                            ))
-                            .await
-                        {
-                            error!("[{addr}] Error sending identified: {e}");
-                            break;
-                        }
-                        debug!("[{addr}] Sent identified response");
-                        drop(write);
-
-                        // If identified successfully, start processing Twitch messages
-                        if is_identified {
-                            debug!("[{addr}] Streamer identified, waiting for twitchStart message");
-                        }
-                    } else {
-                        error!("[{addr}] Identify message missing authentication field");
+                    if let Err(e) = handle_identify_message(identify, &writer, &assistant, &addr).await {
+                        error!("[{addr}] Error handling identify message: {e}");
+                        break;
                     }
                 }
 
                 // Handle ping message
                 if json_msg.get("ping").is_some() {
-                    let assistant_locked = assistant.lock().await;
-                    let pong = assistant_locked.create_pong_message();
-                    drop(assistant_locked);
-
-                    let mut write = writer.lock().await;
-                    if let Err(e) = write
-                        .send(Message::Text(
-                            serde_json::to_string(&pong).expect("Failed to serialize pong message"),
-                        ))
-                        .await
-                    {
-                        error!("[{addr}] Error sending pong: {e}");
+                    if let Err(e) = handle_ping_message(&writer, &assistant, &addr).await {
+                        error!("[{addr}] Error handling ping message: {e}");
                         break;
                     }
-                    debug!("[{addr}] Sent pong response");
                 }
 
                 // Handle event messages
                 if json_msg.get("event").is_some() {
-                    debug!("[{addr}] Received event from streamer");
+                    handle_event_message(&addr).await;
                 }
 
                 // Handle twitchStart message
                 if let Some(twitch_start) = json_msg.get("twitchStart") {
-                    debug!("[{addr}] Received twitchStart message");
-                    let channel_name = twitch_start
-                        .get("channelName")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let channel_id = twitch_start
-                        .get("channelId")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let encrypted_token = twitch_start
-                        .get("accessToken")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    if let (Some(encrypted_token), Some(channel_id)) = (encrypted_token, channel_id)
-                    {
-                        let assistant_locked = assistant.lock().await;
-                        let password = assistant_locked.password.clone();
-                        drop(assistant_locked);
-
-                        if let Some(access_token) =
-                            decrypt_access_token(&password, &encrypted_token)
-                        {
-                            // Use channel_name if provided, otherwise use the channel_id
-                            let channel = channel_name.unwrap_or_else(|| channel_id.clone());
-                            info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
-                            tokio::spawn(connect_twitch_irc(
-                                writer.clone(),
-                                assistant.clone(),
-                                channel,
-                                access_token,
-                                addr.clone(),
-                            ));
-                        } else {
-                            error!("[{addr}] Failed to decrypt Twitch access token");
-                        }
-                    } else {
-                        error!("[{addr}] twitchStart message missing channelId or accessToken");
-                    }
+                    handle_twitch_start_message(twitch_start, &writer, &assistant, &addr).await;
                 }
 
                 // Handle response messages
                 if json_msg.get("response").is_some() {
-                    debug!("[{addr}] Received response from streamer");
+                    handle_response_message(&addr).await;
                 }
             }
             Message::Ping(data) => {
-                debug!("[{addr}] Received WebSocket ping");
-                let mut write = writer.lock().await;
-                if let Err(e) = write.send(Message::Pong(data)).await {
-                    error!("[{addr}] Error sending WebSocket pong: {e}");
+                if let Err(e) = handle_websocket_ping(data, &writer, &addr).await {
+                    error!("[{addr}] Error handling WebSocket ping: {e}");
                     break;
                 }
-                debug!("[{addr}] Sent WebSocket pong");
             }
             Message::Close(_) => {
                 debug!("[{addr}] Connection closed by streamer");
