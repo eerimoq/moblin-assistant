@@ -1,5 +1,3 @@
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -63,6 +61,7 @@ struct IdentifiedMessage {
 enum Platform {
     Soop {},
     Kick {},
+    #[allow(clippy::enum_variant_names)]
     OpenStreamingPlatform {},
     Twitch {},
     YouTube {},
@@ -128,8 +127,8 @@ struct IdentifyData {
 #[serde(rename_all = "camelCase")]
 struct TwitchStartData {
     channel_name: Option<String>,
-    channel_id: Option<String>,
-    access_token: Option<String>,
+    channel_id: String,
+    access_token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -229,34 +228,6 @@ type WsWriter = Arc<
     >,
 >;
 
-fn decrypt_access_token(password: &str, encrypted_base64: &str) -> Option<String> {
-    let encrypted = match BASE64.decode(encrypted_base64) {
-        Ok(data) => data,
-        Err(_) => {
-            error!("Failed to base64 decode access token");
-            return None;
-        }
-    };
-    // AES-GCM combined format: nonce (12 bytes) + ciphertext + tag (16 bytes)
-    if encrypted.len() < 28 {
-        error!("Encrypted access token too short");
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    let key = hasher.finalize();
-    let cipher = Aes256Gcm::new(&key);
-    let nonce = aes_gcm::Nonce::from_slice(&encrypted[..12]);
-    let ciphertext = &encrypted[12..];
-    match cipher.decrypt(nonce, ciphertext) {
-        Ok(decrypted) => String::from_utf8(decrypted).ok(),
-        Err(_) => {
-            error!("Failed to decrypt access token (wrong password or corrupted data)");
-            None
-        }
-    }
-}
-
 fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostSegment> {
     let mut segments: Vec<ChatPostSegment> = Vec::new();
     let mut id: i32 = 0;
@@ -324,7 +295,6 @@ async fn connect_twitch_irc(
     writer: WsWriter,
     assistant: Arc<Mutex<Assistant>>,
     channel_name: String,
-    _access_token: String,
     addr: String,
 ) {
     info!("[{addr}] Connecting to Twitch IRC for channel: {channel_name}");
@@ -440,8 +410,7 @@ async fn handle_identify_message(
     let mut write = writer.lock().await;
     write
         .send(Message::Text(
-            serde_json::to_string(&response)
-                .expect("Failed to serialize identified response"),
+            serde_json::to_string(&response).expect("Failed to serialize identified response"),
         ))
         .await?;
     debug!("[{addr}] Sent identified response");
@@ -485,33 +454,14 @@ async fn handle_twitch_start_message(
 ) {
     debug!("[{addr}] Received twitchStart message");
 
-    if let (Some(encrypted_token), Some(channel_id)) =
-        (&twitch_start.access_token, &twitch_start.channel_id)
-    {
-        let assistant_locked = assistant.lock().await;
-        let password = assistant_locked.password.clone();
-        drop(assistant_locked);
-
-        if let Some(access_token) = decrypt_access_token(&password, encrypted_token) {
-            // Use channel_name if provided, otherwise use the channel_id
-            let channel = twitch_start
-                .channel_name
-                .as_ref()
-                .unwrap_or(channel_id)
-                .clone();
-            info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
-            tokio::spawn(connect_twitch_irc(
-                writer.clone(),
-                assistant.clone(),
-                channel,
-                access_token,
-                addr.to_string(),
-            ));
-        } else {
-            error!("[{addr}] Failed to decrypt Twitch access token");
-        }
-    } else {
-        error!("[{addr}] twitchStart message missing channelId or accessToken");
+    if let Some(channel) = &twitch_start.channel_name {
+        info!("[{addr}] Starting Twitch IRC connection for channel: {channel}");
+        tokio::spawn(connect_twitch_irc(
+            writer.clone(),
+            assistant.clone(),
+            channel.clone(),
+            addr.to_string(),
+        ));
     }
 }
 
@@ -596,7 +546,9 @@ async fn handle_streamer_connection(
 
                 match &incoming {
                     IncomingMessage::Identify(identify) => {
-                        if let Err(e) = handle_identify_message(identify, &writer, &assistant, &addr).await {
+                        if let Err(e) =
+                            handle_identify_message(identify, &writer, &assistant, &addr).await
+                        {
                             error!("[{addr}] Error handling identify message: {e}");
                             break;
                         }
@@ -846,8 +798,8 @@ mod tests {
         match msg {
             IncomingMessage::TwitchStart(data) => {
                 assert_eq!(data.channel_name.as_deref(), Some("mychannel"));
-                assert_eq!(data.channel_id.as_deref(), Some("123"));
-                assert_eq!(data.access_token.as_deref(), Some("encrypted"));
+                assert_eq!(data.channel_id, "123");
+                assert_eq!(data.access_token, "encrypted");
             }
             _ => panic!("Expected TwitchStart variant"),
         }
@@ -860,8 +812,8 @@ mod tests {
         match msg {
             IncomingMessage::TwitchStart(data) => {
                 assert!(data.channel_name.is_none());
-                assert_eq!(data.channel_id.as_deref(), Some("123"));
-                assert_eq!(data.access_token.as_deref(), Some("encrypted"));
+                assert_eq!(data.channel_id, "123");
+                assert_eq!(data.access_token, "encrypted");
             }
             _ => panic!("Expected TwitchStart variant"),
         }
