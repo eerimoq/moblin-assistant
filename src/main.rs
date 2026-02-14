@@ -66,9 +66,9 @@ enum Platform {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RgbColor {
-    red: f64,
-    green: f64,
-    blue: f64,
+    red: i32,
+    green: i32,
+    blue: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,9 +192,9 @@ impl Assistant {
             user: Some("assistant".to_string()),
             user_id: Some("assistant".to_string()),
             user_color: Some(RgbColor {
-                red: 0.0,
-                green: 0.5,
-                blue: 1.0,
+                red: 0,
+                green: 128,
+                blue: 255,
             }),
             user_badges: vec![],
             segments: vec![ChatPostSegment::Text {
