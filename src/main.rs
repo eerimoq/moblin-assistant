@@ -211,9 +211,16 @@ fn log_error(addr: &str, msg: &str) {
 }
 
 fn decrypt_access_token(password: &str, encrypted_base64: &str) -> Option<String> {
-    let encrypted = BASE64.decode(encrypted_base64).ok()?;
+    let encrypted = match BASE64.decode(encrypted_base64) {
+        Ok(data) => data,
+        Err(_) => {
+            eprintln!("Failed to base64 decode access token");
+            return None;
+        }
+    };
     // AES-GCM combined format: nonce (12 bytes) + ciphertext + tag (16 bytes)
     if encrypted.len() < 28 {
+        eprintln!("Encrypted access token too short");
         return None;
     }
     let mut hasher = Sha256::new();
@@ -222,8 +229,13 @@ fn decrypt_access_token(password: &str, encrypted_base64: &str) -> Option<String
     let cipher = Aes256Gcm::new(&key);
     let nonce = aes_gcm::Nonce::from_slice(&encrypted[..12]);
     let ciphertext = &encrypted[12..];
-    let decrypted = cipher.decrypt(nonce, ciphertext).ok()?;
-    String::from_utf8(decrypted).ok()
+    match cipher.decrypt(nonce, ciphertext) {
+        Ok(decrypted) => String::from_utf8(decrypted).ok(),
+        Err(_) => {
+            eprintln!("Failed to decrypt access token (wrong password or corrupted data)");
+            None
+        }
+    }
 }
 
 fn parse_irc_color(color_str: &str) -> Option<RgbColor> {
@@ -364,14 +376,16 @@ async fn connect_twitch_irc(
         return;
     }
 
-    // Authenticate
-    let pass_cmd = format!("PASS oauth:{}", access_token);
-    if let Err(e) = twitch_write.send(Message::Text(pass_cmd)).await {
+    // Authenticate with the OAuth token for channel access
+    if let Err(e) = twitch_write
+        .send(Message::Text(format!("PASS oauth:{}", access_token)))
+        .await
+    {
         log_error(&addr, &format!("Failed to send PASS: {}", e));
         return;
     }
 
-    // Use a random anonymous nick as fallback
+    // Use anonymous nick since we only need to read chat, not send messages
     let nick = format!("justinfan{}", rand::random::<u32>() % 100000);
     if let Err(e) = twitch_write
         .send(Message::Text(format!("NICK {}", nick)))
