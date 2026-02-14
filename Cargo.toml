@@ -15,3 +15,5 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 hex = "0.4"
 futures-util = "0.3"
+aes-gcm = "0.10"
+twitch-irc = { version = "5.0", features = ["transport-tcp", "transport-tcp-native-tls"] }

@@ -1,3 +1,5 @@
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -9,6 +11,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+use twitch_irc::login::StaticLoginCredentials;
+use twitch_irc::message::ServerMessage;
+use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 const API_VERSION: &str = "0.1";
 const DEFAULT_PORT: u16 = 2345;
@@ -183,46 +188,6 @@ impl Assistant {
         })
     }
 
-    fn create_chat_message_request(&mut self, message: &str) -> serde_json::Value {
-        let chat_message = ChatMessage {
-            id: self.next_chat_message_id(),
-            platform: Platform::Twitch {},
-            message_id: None,
-            display_name: Some("Assistant".to_string()),
-            user: Some("assistant".to_string()),
-            user_id: Some("assistant".to_string()),
-            user_color: Some(RgbColor {
-                red: 0,
-                green: 128,
-                blue: 255,
-            }),
-            user_badges: vec![],
-            segments: vec![ChatPostSegment {
-                id: 0,
-                text: Some(message.to_string()),
-                url: None,
-            }],
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            is_action: false,
-            is_moderator: false,
-            is_subscriber: false,
-            is_owner: false,
-            bits: None,
-        };
-
-        let request_id = self.next_id();
-        json!({
-            "request": {
-                "id": request_id,
-                "data": {
-                    "chatMessages": {
-                        "history": false,
-                        "messages": [chat_message]
-                    }
-                }
-            }
-        })
-    }
 }
 
 fn random_string() -> String {
@@ -248,48 +213,127 @@ fn log_error(addr: &str, msg: &str) {
     eprintln!("[{}] [{}] {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"), addr, msg);
 }
 
-async fn send_delayed_chat_messages(
+fn decrypt_access_token(password: &str, encrypted_base64: &str) -> Option<String> {
+    let encrypted = match BASE64.decode(encrypted_base64) {
+        Ok(data) => data,
+        Err(_) => {
+            eprintln!("Failed to base64 decode access token");
+            return None;
+        }
+    };
+    // AES-GCM combined format: nonce (12 bytes) + ciphertext + tag (16 bytes)
+    if encrypted.len() < 28 {
+        eprintln!("Encrypted access token too short");
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    let key = hasher.finalize();
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = aes_gcm::Nonce::from_slice(&encrypted[..12]);
+    let ciphertext = &encrypted[12..];
+    match cipher.decrypt(nonce, ciphertext) {
+        Ok(decrypted) => String::from_utf8(decrypted).ok(),
+        Err(_) => {
+            eprintln!("Failed to decrypt access token (wrong password or corrupted data)");
+            None
+        }
+    }
+}
+
+async fn connect_twitch_irc(
     writer: WsWriter,
     assistant: Arc<Mutex<Assistant>>,
+    channel_name: String,
+    _access_token: String,
     addr: String,
 ) {
-    // Send first chat message after 2 seconds
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    {
-        let mut assistant_locked = assistant.lock().await;
-        let chat_request =
-            assistant_locked.create_chat_message_request("Hello from Rust Moblin Assistant! 🎉");
-        drop(assistant_locked);
+    log(&addr, &format!("Connecting to Twitch IRC for channel: {}", channel_name));
 
-        if let Ok(msg_str) = serde_json::to_string(&chat_request) {
-            log(&addr, &format!("Sending chat message: {}", msg_str));
-            let mut write = writer.lock().await;
-            if let Err(e) = write.send(Message::Text(msg_str)).await {
-                log_error(
-                    &addr,
-                    &format!("Error sending chat message, aborting delayed messages: {}", e),
-                );
-                return;
+    // Use anonymous credentials since we only need to read chat messages
+    let credentials = StaticLoginCredentials::anonymous();
+    let config = ClientConfig::new_simple(credentials);
+    let (mut incoming_messages, client) =
+        TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(config);
+
+    // twitch-irc crate expects channel names without '#' prefix, in lowercase
+    let channel = channel_name.trim_start_matches('#').to_lowercase();
+    if let Err(e) = client.join(channel.clone()) {
+        log_error(&addr, &format!("Failed to join Twitch channel '{}': {}", channel, e));
+        return;
+    }
+
+    log(&addr, &format!("Joined Twitch channel #{}", channel));
+
+    while let Some(message) = incoming_messages.recv().await {
+        if let ServerMessage::Privmsg(msg) = message {
+            let user_color = msg.name_color.map(|c| RgbColor {
+                red: c.r as i32,
+                green: c.g as i32,
+                blue: c.b as i32,
+            });
+
+            let user_badges: Vec<String> = msg
+                .badges
+                .iter()
+                .map(|b| format!("{}/{}", b.name, b.version))
+                .collect();
+
+            let is_moderator = msg.badges.iter().any(|b| b.name == "moderator");
+            let is_subscriber = msg.badges.iter().any(|b| b.name == "subscriber");
+            let is_owner = msg.badges.iter().any(|b| b.name == "broadcaster");
+
+            let mut assistant_locked = assistant.lock().await;
+            let chat_message_id = assistant_locked.next_chat_message_id();
+            let request_id = assistant_locked.next_id();
+            drop(assistant_locked);
+
+            let chat_msg = ChatMessage {
+                id: chat_message_id,
+                platform: Platform::Twitch {},
+                message_id: Some(msg.message_id.clone()),
+                display_name: Some(msg.sender.name.clone()),
+                user: Some(msg.sender.login.clone()),
+                user_id: Some(msg.sender.id.clone()),
+                user_color,
+                user_badges,
+                segments: vec![ChatPostSegment {
+                    id: 0,
+                    text: Some(msg.message_text.clone()),
+                    url: None,
+                }],
+                timestamp: msg.server_timestamp.to_rfc3339(),
+                is_action: msg.is_action,
+                is_moderator,
+                is_subscriber,
+                is_owner,
+                bits: msg.bits.map(|b| b.to_string()),
+            };
+
+            let chat_request = json!({
+                "request": {
+                    "id": request_id,
+                    "data": {
+                        "chatMessages": {
+                            "history": false,
+                            "messages": [chat_msg]
+                        }
+                    }
+                }
+            });
+
+            if let Ok(msg_str) = serde_json::to_string(&chat_request) {
+                log(&addr, &format!("Forwarding Twitch chat message: {}", msg_str));
+                let mut write = writer.lock().await;
+                if let Err(e) = write.send(Message::Text(msg_str)).await {
+                    log_error(&addr, &format!("Error forwarding chat message: {}", e));
+                    return;
+                }
             }
         }
     }
 
-    // Send second message after 3 more seconds
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-    {
-        let mut assistant_locked = assistant.lock().await;
-        let chat_request =
-            assistant_locked.create_chat_message_request("This is a second hardcoded message!");
-        drop(assistant_locked);
-
-        if let Ok(msg_str) = serde_json::to_string(&chat_request) {
-            log(&addr, &format!("Sending second chat message: {}", msg_str));
-            let mut write = writer.lock().await;
-            if let Err(e) = write.send(Message::Text(msg_str)).await {
-                log_error(&addr, &format!("Error sending second chat message: {}", e));
-            }
-        }
-    }
+    log(&addr, "Twitch IRC connection ended");
 }
 
 async fn handle_streamer_connection(
@@ -393,15 +437,9 @@ async fn handle_streamer_connection(
                         log(&addr, "Sent identified response");
                         drop(write);
 
-                        // If identified successfully, spawn a task to send delayed chat messages
-                        // without blocking the message read loop
+                        // If identified successfully, start processing Twitch messages
                         if is_identified {
-                            log(&addr, "Spawning delayed chat message task");
-                            tokio::spawn(send_delayed_chat_messages(
-                                writer.clone(),
-                                assistant.clone(),
-                                addr.clone(),
-                            ));
+                            log(&addr, "Streamer identified, waiting for twitchStart message");
                         }
                     } else {
                         log_error(&addr, "Identify message missing authentication field");
@@ -431,6 +469,56 @@ async fn handle_streamer_connection(
                 // Handle event messages
                 if json_msg.get("event").is_some() {
                     log(&addr, "Received event from streamer");
+                }
+
+                // Handle twitchStart message
+                if let Some(twitch_start) = json_msg.get("twitchStart") {
+                    log(&addr, "Received twitchStart message");
+                    let channel_name = twitch_start
+                        .get("channelName")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let channel_id = twitch_start
+                        .get("channelId")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let encrypted_token = twitch_start
+                        .get("accessToken")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    if let (Some(encrypted_token), Some(channel_id)) =
+                        (encrypted_token, channel_id)
+                    {
+                        let assistant_locked = assistant.lock().await;
+                        let password = assistant_locked.password.clone();
+                        drop(assistant_locked);
+
+                        if let Some(access_token) =
+                            decrypt_access_token(&password, &encrypted_token)
+                        {
+                            // Use channel_name if provided, otherwise use the channel_id
+                            let channel = channel_name.unwrap_or_else(|| channel_id.clone());
+                            log(
+                                &addr,
+                                &format!("Starting Twitch IRC connection for channel: {}", channel),
+                            );
+                            tokio::spawn(connect_twitch_irc(
+                                writer.clone(),
+                                assistant.clone(),
+                                channel,
+                                access_token,
+                                addr.clone(),
+                            ));
+                        } else {
+                            log_error(&addr, "Failed to decrypt Twitch access token");
+                        }
+                    } else {
+                        log_error(
+                            &addr,
+                            "twitchStart message missing channelId or accessToken",
+                        );
+                    }
                 }
 
                 // Handle response messages
