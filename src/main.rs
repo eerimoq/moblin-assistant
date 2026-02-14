@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -52,25 +53,31 @@ struct IdentifiedMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Platform {
-    #[serde(rename = "type")]
-    platform_type: String,
+#[serde(rename_all = "camelCase")]
+enum Platform {
+    Soop {},
+    Kick {},
+    OpenStreamingPlatform {},
+    Twitch {},
+    YouTube {},
+    #[serde(rename = "dlive")]
+    DLive {},
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RgbColor {
-    red: f64,
-    green: f64,
-    blue: f64,
+    red: i32,
+    green: i32,
+    blue: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum ChatPostSegment {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "url")]
-    Url { url: String },
+struct ChatPostSegment {
+    id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -179,21 +186,21 @@ impl Assistant {
     fn create_chat_message_request(&mut self, message: &str) -> serde_json::Value {
         let chat_message = ChatMessage {
             id: self.next_chat_message_id(),
-            platform: Platform {
-                platform_type: "assistant".to_string(),
-            },
+            platform: Platform::Twitch {},
             message_id: None,
             display_name: Some("Assistant".to_string()),
             user: Some("assistant".to_string()),
             user_id: Some("assistant".to_string()),
             user_color: Some(RgbColor {
-                red: 0.0,
-                green: 0.5,
-                blue: 1.0,
+                red: 0,
+                green: 128,
+                blue: 255,
             }),
             user_badges: vec![],
-            segments: vec![ChatPostSegment::Text {
-                text: message.to_string(),
+            segments: vec![ChatPostSegment {
+                id: 0,
+                text: Some(message.to_string()),
+                url: None,
             }],
             timestamp: chrono::Utc::now().to_rfc3339(),
             is_action: false,
@@ -224,6 +231,67 @@ fn random_string() -> String {
     hex::encode(bytes)
 }
 
+type WsWriter = Arc<
+    Mutex<
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+            Message,
+        >,
+    >,
+>;
+
+fn log(addr: &str, msg: &str) {
+    println!("[{}] [{}] {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"), addr, msg);
+}
+
+fn log_error(addr: &str, msg: &str) {
+    eprintln!("[{}] [{}] {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"), addr, msg);
+}
+
+async fn send_delayed_chat_messages(
+    writer: WsWriter,
+    assistant: Arc<Mutex<Assistant>>,
+    addr: String,
+) {
+    // Send first chat message after 2 seconds
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    {
+        let mut assistant_locked = assistant.lock().await;
+        let chat_request =
+            assistant_locked.create_chat_message_request("Hello from Rust Moblin Assistant! 🎉");
+        drop(assistant_locked);
+
+        if let Ok(msg_str) = serde_json::to_string(&chat_request) {
+            log(&addr, &format!("Sending chat message: {}", msg_str));
+            let mut write = writer.lock().await;
+            if let Err(e) = write.send(Message::Text(msg_str)).await {
+                log_error(
+                    &addr,
+                    &format!("Error sending chat message, aborting delayed messages: {}", e),
+                );
+                return;
+            }
+        }
+    }
+
+    // Send second message after 3 more seconds
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    {
+        let mut assistant_locked = assistant.lock().await;
+        let chat_request =
+            assistant_locked.create_chat_message_request("This is a second hardcoded message!");
+        drop(assistant_locked);
+
+        if let Ok(msg_str) = serde_json::to_string(&chat_request) {
+            log(&addr, &format!("Sending second chat message: {}", msg_str));
+            let mut write = writer.lock().await;
+            if let Err(e) = write.send(Message::Text(msg_str)).await {
+                log_error(&addr, &format!("Error sending second chat message: {}", e));
+            }
+        }
+    }
+}
+
 async fn handle_streamer_connection(
     stream: tokio::net::TcpStream,
     assistant: Arc<Mutex<Assistant>>,
@@ -232,31 +300,37 @@ async fn handle_streamer_connection(
         .peer_addr()
         .expect("Failed to get peer address")
         .to_string();
-    println!("New streamer connection from: {}", addr);
+    log(&addr, "New streamer connection");
 
     let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
+        Ok(ws) => {
+            log(&addr, "WebSocket handshake completed");
+            ws
+        }
         Err(e) => {
-            eprintln!("Error during WebSocket handshake: {}", e);
+            log_error(&addr, &format!("Error during WebSocket handshake: {}", e));
             return;
         }
     };
 
-    let (mut write, mut read) = ws_stream.split();
-    use futures_util::{SinkExt, StreamExt};
+    let (write, mut read) = ws_stream.split();
+    let writer: WsWriter = Arc::new(Mutex::new(write));
 
     // Send hello message
     {
         let assistant = assistant.lock().await;
         let hello = assistant.create_hello_message();
+        let mut write = writer.lock().await;
         if let Err(e) = write
-            .send(Message::Text(serde_json::to_string(&hello).expect("Failed to serialize hello message")))
+            .send(Message::Text(
+                serde_json::to_string(&hello).expect("Failed to serialize hello message"),
+            ))
             .await
         {
-            eprintln!("Error sending hello: {}", e);
+            log_error(&addr, &format!("Error sending hello: {}", e));
             return;
         }
-        println!("Sent hello message");
+        log(&addr, "Sent hello message with authentication challenge");
     }
 
     // Handle incoming messages
@@ -264,82 +338,73 @@ async fn handle_streamer_connection(
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("Error receiving message: {}", e);
+                log_error(&addr, &format!("Error receiving message: {}", e));
                 break;
             }
         };
 
         match msg {
             Message::Text(text) => {
-                println!("Received: {}", text);
-                
+                log(&addr, &format!("Received message: {}", text));
+
                 let json_msg: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("Error parsing JSON: {}", e);
+                        log_error(&addr, &format!("Error parsing JSON: {}", e));
                         continue;
                     }
                 };
 
                 // Handle identify message
                 if let Some(identify) = json_msg.get("identify") {
-                    if let Some(auth) = identify.get("authentication").and_then(|a| a.as_str()) {
+                    log(&addr, "Processing identify message");
+                    if let Some(auth) =
+                        identify.get("authentication").and_then(|a| a.as_str())
+                    {
                         let mut assistant_locked = assistant.lock().await;
                         let expected_hash = assistant_locked.hash_password();
-                        
+
                         let result = if assistant_locked.identified {
+                            log(&addr, "Streamer already identified");
                             IdentifiedResult::AlreadyIdentified {}
                         } else if auth == expected_hash {
                             assistant_locked.identified = true;
-                            println!("Streamer successfully identified");
+                            log(&addr, "Streamer successfully identified");
                             IdentifiedResult::Ok {}
                         } else {
-                            eprintln!("Wrong password from streamer");
+                            log_error(&addr, "Wrong password from streamer");
                             IdentifiedResult::WrongPassword {}
                         };
 
                         let response = assistant_locked.create_identified_message(result);
                         let is_identified = assistant_locked.identified;
-                        drop(assistant_locked); // Release lock before sleeping
-                        
-                        if let Err(e) = write
-                            .send(Message::Text(serde_json::to_string(&response).expect("Failed to serialize identified response")))
-                            .await
+                        drop(assistant_locked);
+
+                        let mut write = writer.lock().await;
+                        if let Err(e) = write.send(Message::Text(
+                            serde_json::to_string(&response)
+                                .expect("Failed to serialize identified response"),
+                        ))
+                        .await
                         {
-                            eprintln!("Error sending identified: {}", e);
+                            log_error(&addr, &format!("Error sending identified: {}", e));
                             break;
                         }
+                        log(&addr, "Sent identified response");
+                        drop(write);
 
-                        // If identified successfully, send hardcoded chat messages after a delay
+                        // If identified successfully, spawn a task to send delayed chat messages
+                        // without blocking the message read loop
                         if is_identified {
-                            // Send first chat message after 2 seconds
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            let mut assistant_locked = assistant.lock().await;
-                            let chat_request = assistant_locked.create_chat_message_request("Hello from Rust Moblin Assistant! 🎉");
-                            drop(assistant_locked); // Release lock
-                            
-                            if let Ok(msg_str) = serde_json::to_string(&chat_request) {
-                                println!("Sending chat message: {}", msg_str);
-                                if let Err(e) = write.send(Message::Text(msg_str)).await {
-                                    eprintln!("Error sending chat message: {}", e);
-                                    break;
-                                }
-                            }
-                            
-                            // Send second message after 3 more seconds
-                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                            let mut assistant_locked = assistant.lock().await;
-                            let chat_request2 = assistant_locked.create_chat_message_request("This is a second hardcoded message!");
-                            drop(assistant_locked); // Release lock
-                            
-                            if let Ok(msg_str) = serde_json::to_string(&chat_request2) {
-                                println!("Sending second chat message: {}", msg_str);
-                                if let Err(e) = write.send(Message::Text(msg_str)).await {
-                                    eprintln!("Error sending second chat message: {}", e);
-                                    break;
-                                }
-                            }
+                            log(&addr, "Spawning delayed chat message task");
+                            tokio::spawn(send_delayed_chat_messages(
+                                writer.clone(),
+                                assistant.clone(),
+                                addr.clone(),
+                            ));
                         }
+                    } else {
+                        log_error(&addr, "Identify message missing authentication field");
                     }
                 }
 
@@ -348,58 +413,80 @@ async fn handle_streamer_connection(
                     let assistant_locked = assistant.lock().await;
                     let pong = assistant_locked.create_pong_message();
                     drop(assistant_locked);
-                    
+
+                    let mut write = writer.lock().await;
                     if let Err(e) = write
-                        .send(Message::Text(serde_json::to_string(&pong).expect("Failed to serialize pong message")))
+                        .send(Message::Text(
+                            serde_json::to_string(&pong)
+                                .expect("Failed to serialize pong message"),
+                        ))
                         .await
                     {
-                        eprintln!("Error sending pong: {}", e);
+                        log_error(&addr, &format!("Error sending pong: {}", e));
                         break;
                     }
-                    println!("Sent pong message");
+                    log(&addr, "Sent pong response");
                 }
 
-                // Handle event messages (just log them)
-                if let Some(_event) = json_msg.get("event") {
-                    println!("Received event from streamer");
+                // Handle event messages
+                if json_msg.get("event").is_some() {
+                    log(&addr, "Received event from streamer");
                 }
 
-                // Handle response messages (just log them)
-                if let Some(_response) = json_msg.get("response") {
-                    println!("Received response from streamer");
+                // Handle response messages
+                if json_msg.get("response").is_some() {
+                    log(&addr, "Received response from streamer");
                 }
             }
             Message::Ping(data) => {
+                log(&addr, "Received WebSocket ping");
+                let mut write = writer.lock().await;
                 if let Err(e) = write.send(Message::Pong(data)).await {
-                    eprintln!("Error sending pong: {}", e);
+                    log_error(&addr, &format!("Error sending WebSocket pong: {}", e));
                     break;
                 }
+                log(&addr, "Sent WebSocket pong");
             }
             Message::Close(_) => {
-                println!("Connection closed by streamer");
+                log(&addr, "Connection closed by streamer");
                 break;
             }
-            _ => {}
+            _ => {
+                log(&addr, "Received unhandled message type");
+            }
         }
     }
 
-    println!("Streamer disconnected: {}", addr);
+    log(&addr, "Streamer disconnected");
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    println!("Starting Moblin Assistant server on port {}", args.port);
+    println!(
+        "[{}] Starting Moblin Assistant server on port {}",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        args.port
+    );
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", args.port))
         .await
         .expect("Failed to bind");
 
-    println!("Server listening on 0.0.0.0:{}", args.port);
+    println!(
+        "[{}] Server listening on 0.0.0.0:{}",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        args.port
+    );
 
     loop {
-        let (stream, _) = listener.accept().await.expect("Failed to accept connection");
+        let (stream, addr) = listener.accept().await.expect("Failed to accept connection");
+        println!(
+            "[{}] Accepted TCP connection from {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            addr
+        );
         let assistant = Arc::new(Mutex::new(Assistant::new(args.password.clone())));
         tokio::spawn(handle_streamer_connection(stream, assistant));
     }
