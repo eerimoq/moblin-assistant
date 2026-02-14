@@ -11,6 +11,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+use twitch_irc::login::StaticLoginCredentials;
+use twitch_irc::message::ServerMessage;
+use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 const API_VERSION: &str = "0.1";
 const DEFAULT_PORT: u16 = 2345;
@@ -238,110 +241,6 @@ fn decrypt_access_token(password: &str, encrypted_base64: &str) -> Option<String
     }
 }
 
-fn parse_irc_color(color_str: &str) -> Option<RgbColor> {
-    let hex = color_str.trim_start_matches('#');
-    if hex.len() != 6 {
-        return None;
-    }
-    let red = i32::from_str_radix(&hex[0..2], 16).ok()?;
-    let green = i32::from_str_radix(&hex[2..4], 16).ok()?;
-    let blue = i32::from_str_radix(&hex[4..6], 16).ok()?;
-    Some(RgbColor { red, green, blue })
-}
-
-fn parse_twitch_privmsg(
-    tags: &str,
-    _prefix: &str,
-    message_text: &str,
-    chat_message_id: i32,
-) -> ChatMessage {
-    let mut display_name: Option<String> = None;
-    let mut user_color: Option<RgbColor> = None;
-    let mut user_id: Option<String> = None;
-    let mut message_id: Option<String> = None;
-    let mut is_mod = false;
-    let mut is_subscriber = false;
-    let mut bits: Option<String> = None;
-    let mut user_login: Option<String> = None;
-    let mut badge_urls: Vec<String> = Vec::new();
-
-    for tag in tags.split(';') {
-        let mut parts = tag.splitn(2, '=');
-        let key = parts.next().unwrap_or("");
-        let value = parts.next().unwrap_or("");
-        match key {
-            "display-name" => {
-                if !value.is_empty() {
-                    display_name = Some(value.to_string());
-                }
-            }
-            "color" => {
-                user_color = parse_irc_color(value);
-            }
-            "user-id" => {
-                user_id = Some(value.to_string());
-            }
-            "id" => {
-                message_id = Some(value.to_string());
-            }
-            "mod" => {
-                is_mod = value == "1";
-            }
-            "subscriber" => {
-                is_subscriber = value == "1";
-            }
-            "bits" => {
-                if !value.is_empty() {
-                    bits = Some(value.to_string());
-                }
-            }
-            "login" => {
-                user_login = Some(value.to_string());
-            }
-            "badges" => {
-                for badge in value.split(',') {
-                    if !badge.is_empty() {
-                        badge_urls.push(badge.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let is_action = message_text.starts_with("\x01ACTION ") && message_text.ends_with('\x01');
-    let clean_text = if is_action {
-        message_text
-            .trim_start_matches("\x01ACTION ")
-            .trim_end_matches('\x01')
-            .to_string()
-    } else {
-        message_text.to_string()
-    };
-
-    ChatMessage {
-        id: chat_message_id,
-        platform: Platform::Twitch {},
-        message_id,
-        display_name: display_name.clone(),
-        user: user_login.or(display_name.as_ref().map(|n| n.to_lowercase())),
-        user_id,
-        user_color,
-        user_badges: badge_urls,
-        segments: vec![ChatPostSegment {
-            id: 0,
-            text: Some(clean_text),
-            url: None,
-        }],
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        is_action,
-        is_moderator: is_mod,
-        is_subscriber,
-        is_owner: false,
-        bits,
-    }
-}
-
 async fn connect_twitch_irc(
     writer: WsWriter,
     assistant: Arc<Mutex<Assistant>>,
@@ -351,158 +250,86 @@ async fn connect_twitch_irc(
 ) {
     log(&addr, &format!("Connecting to Twitch IRC for channel: {}", channel_name));
 
-    let twitch_url = "wss://irc-ws.chat.twitch.tv:443";
-    let (ws_stream, _) = match tokio_tungstenite::connect_async(twitch_url).await {
-        Ok(conn) => {
-            log(&addr, "Connected to Twitch IRC WebSocket");
-            conn
-        }
-        Err(e) => {
-            log_error(&addr, &format!("Failed to connect to Twitch IRC: {}", e));
-            return;
-        }
-    };
+    let credentials = StaticLoginCredentials::new(
+        "justinfan12345".to_owned(),
+        Some(access_token),
+    );
+    let config = ClientConfig::new_simple(credentials);
+    let (mut incoming_messages, client) =
+        TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(config);
 
-    let (mut twitch_write, mut twitch_read) = ws_stream.split();
-
-    // Request IRC tags and commands capabilities
-    if let Err(e) = twitch_write
-        .send(Message::Text(
-            "CAP REQ :twitch.tv/tags twitch.tv/commands".to_string(),
-        ))
-        .await
-    {
-        log_error(&addr, &format!("Failed to send CAP REQ: {}", e));
+    let channel = channel_name.trim_start_matches('#').to_lowercase();
+    if let Err(e) = client.join(channel.clone()) {
+        log_error(&addr, &format!("Failed to join Twitch channel: {}", e));
         return;
     }
 
-    // Authenticate with the OAuth token for channel access
-    if let Err(e) = twitch_write
-        .send(Message::Text(format!("PASS oauth:{}", access_token)))
-        .await
-    {
-        log_error(&addr, &format!("Failed to send PASS: {}", e));
-        return;
-    }
+    log(&addr, &format!("Joined Twitch channel #{}", channel));
 
-    // Use anonymous nick since we only need to read chat, not send messages
-    let nick = format!("justinfan{}", rand::random::<u32>() % 100000);
-    if let Err(e) = twitch_write
-        .send(Message::Text(format!("NICK {}", nick)))
-        .await
-    {
-        log_error(&addr, &format!("Failed to send NICK: {}", e));
-        return;
-    }
+    while let Some(message) = incoming_messages.recv().await {
+        if let ServerMessage::Privmsg(msg) = message {
+            let user_color = msg.name_color.map(|c| RgbColor {
+                red: c.r as i32,
+                green: c.g as i32,
+                blue: c.b as i32,
+            });
 
-    // Join channel
-    let channel = if channel_name.starts_with('#') {
-        channel_name.clone()
-    } else {
-        format!("#{}", channel_name.to_lowercase())
-    };
-    if let Err(e) = twitch_write
-        .send(Message::Text(format!("JOIN {}", channel)))
-        .await
-    {
-        log_error(&addr, &format!("Failed to send JOIN: {}", e));
-        return;
-    }
+            let user_badges: Vec<String> = msg
+                .badges
+                .iter()
+                .map(|b| format!("{}/{}", b.name, b.version))
+                .collect();
 
-    log(&addr, &format!("Joined Twitch channel {}", channel));
+            let is_moderator = msg.badges.iter().any(|b| b.name == "moderator");
+            let is_subscriber = msg.badges.iter().any(|b| b.name == "subscriber");
 
-    // Read messages from Twitch IRC
-    while let Some(msg) = twitch_read.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                log_error(&addr, &format!("Twitch IRC read error: {}", e));
-                break;
-            }
-        };
+            let mut assistant_locked = assistant.lock().await;
+            let chat_message_id = assistant_locked.next_chat_message_id();
+            let request_id = assistant_locked.next_id();
+            drop(assistant_locked);
 
-        match msg {
-            Message::Text(text) => {
-                for line in text.lines() {
-                    if line.is_empty() {
-                        continue;
-                    }
+            let chat_msg = ChatMessage {
+                id: chat_message_id,
+                platform: Platform::Twitch {},
+                message_id: Some(msg.message_id.clone()),
+                display_name: Some(msg.sender.name.clone()),
+                user: Some(msg.sender.login.clone()),
+                user_id: Some(msg.sender.id.clone()),
+                user_color,
+                user_badges,
+                segments: vec![ChatPostSegment {
+                    id: 0,
+                    text: Some(msg.message_text.clone()),
+                    url: None,
+                }],
+                timestamp: msg.server_timestamp.to_rfc3339(),
+                is_action: msg.is_action,
+                is_moderator,
+                is_subscriber,
+                is_owner: false,
+                bits: msg.bits.map(|b| b.to_string()),
+            };
 
-                    // Handle PING
-                    if line.starts_with("PING") {
-                        let pong = line.replacen("PING", "PONG", 1);
-                        if let Err(e) = twitch_write.send(Message::Text(pong)).await {
-                            log_error(&addr, &format!("Failed to send PONG to Twitch: {}", e));
-                            return;
-                        }
-                        continue;
-                    }
-
-                    // Parse tagged IRC messages: @tags :prefix COMMAND #channel :message
-                    if !line.starts_with('@') {
-                        continue;
-                    }
-
-                    let Some(space_pos) = line.find(' ') else {
-                        continue;
-                    };
-                    let tags = &line[1..space_pos];
-                    let rest = &line[space_pos + 1..];
-
-                    // Extract prefix and command
-                    let parts: Vec<&str> = rest.splitn(4, ' ').collect();
-                    if parts.len() < 4 {
-                        continue;
-                    }
-
-                    let prefix = parts[0]; // :user!user@user.tmi.twitch.tv
-                    let command = parts[1]; // PRIVMSG
-                                            // parts[2] is the channel
-                    let message_part = parts[3]; // :message text
-
-                    if command != "PRIVMSG" {
-                        continue;
-                    }
-
-                    let message_text = if message_part.starts_with(':') {
-                        &message_part[1..]
-                    } else {
-                        message_part
-                    };
-
-                    let mut assistant_locked = assistant.lock().await;
-                    let chat_message_id = assistant_locked.next_chat_message_id();
-                    let chat_msg = parse_twitch_privmsg(tags, prefix, message_text, chat_message_id);
-                    let request_id = assistant_locked.next_id();
-                    drop(assistant_locked);
-
-                    let chat_request = json!({
-                        "request": {
-                            "id": request_id,
-                            "data": {
-                                "chatMessages": {
-                                    "history": false,
-                                    "messages": [chat_msg]
-                                }
-                            }
-                        }
-                    });
-
-                    if let Ok(msg_str) = serde_json::to_string(&chat_request) {
-                        log(&addr, &format!("Forwarding Twitch chat message: {}", msg_str));
-                        let mut write = writer.lock().await;
-                        if let Err(e) = write.send(Message::Text(msg_str)).await {
-                            log_error(&addr, &format!("Error forwarding chat message: {}", e));
-                            return;
+            let chat_request = json!({
+                "request": {
+                    "id": request_id,
+                    "data": {
+                        "chatMessages": {
+                            "history": false,
+                            "messages": [chat_msg]
                         }
                     }
                 }
+            });
+
+            if let Ok(msg_str) = serde_json::to_string(&chat_request) {
+                log(&addr, &format!("Forwarding Twitch chat message: {}", msg_str));
+                let mut write = writer.lock().await;
+                if let Err(e) = write.send(Message::Text(msg_str)).await {
+                    log_error(&addr, &format!("Error forwarding chat message: {}", e));
+                    return;
+                }
             }
-            Message::Close(_) => {
-                log(&addr, "Twitch IRC connection closed");
-                break;
-            }
-            _ => {}
         }
     }
 
