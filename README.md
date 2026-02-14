@@ -36,6 +36,26 @@ For release builds:
 ./target/release/moblin-assistant --password my-secure-password
 ```
 
+### Logging
+
+The server uses `env_logger` for logging. You can control the log level using the `RUST_LOG` environment variable:
+
+```bash
+# Show only important events (info level)
+RUST_LOG=info cargo run -- --password my-secure-password
+
+# Show all debug information
+RUST_LOG=debug cargo run -- --password my-secure-password
+
+# Show everything including trace
+RUST_LOG=trace cargo run -- --password my-secure-password
+```
+
+By default (without `RUST_LOG` set), the server runs silently. The logging levels used are:
+- **info**: Major events like server startup, connections, authentication success, and Twitch channel joins
+- **debug**: Detailed operational information like message exchanges and protocol details
+- **error**: Error conditions like authentication failures and connection issues
+
 ## Protocol
 
 The server implements the Moblin remote control protocol:
