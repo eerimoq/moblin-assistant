@@ -45,6 +45,7 @@ struct StreamerState {
 }
 
 type DisconnectedStreamers = Arc<Mutex<HashMap<String, (StreamerState, Instant)>>>;
+type ActiveStreamers = Arc<Mutex<HashMap<String, Arc<Mutex<Streamer>>>>>;
 
 pub(crate) struct Streamer {
     me: Weak<Mutex<Self>>,
@@ -58,6 +59,7 @@ pub(crate) struct Streamer {
     writer: WsWriter,
     streamer_id: Option<String>,
     disconnected_streamers: DisconnectedStreamers,
+    active_streamers: ActiveStreamers,
 }
 
 impl Streamer {
@@ -66,6 +68,7 @@ impl Streamer {
         peer_address: String,
         writer: WsWriter,
         disconnected_streamers: DisconnectedStreamers,
+        active_streamers: ActiveStreamers,
     ) -> Arc<Mutex<Self>> {
         Arc::new_cyclic(|me| {
             Mutex::new(Self {
@@ -80,6 +83,7 @@ impl Streamer {
                 writer,
                 streamer_id: None,
                 disconnected_streamers,
+                active_streamers,
             })
         })
     }
@@ -167,14 +171,43 @@ impl Streamer {
             self.identified = true;
             self.streamer_id = identify.streamer_id.clone();
             if let Some(ref streamer_id) = identify.streamer_id {
-                let mut map = self.disconnected_streamers.lock().await;
-                if let Some((state, _)) = map.remove(streamer_id) {
+                // Check if this streamerId is already actively connected.
+                let mut active = self.active_streamers.lock().await;
+                if let Some(old_streamer) = active.remove(streamer_id) {
+                    let mut old = old_streamer.lock().await;
                     info!(
-                        "[{}] Restored state for streamer_id={}",
-                        self.peer_address, streamer_id
+                        "[{}] Taking over from active connection [{}] for streamer_id={}",
+                        self.peer_address, old.peer_address, streamer_id
                     );
-                    self.request_id = state.request_id;
-                    self.chat_message_id = state.chat_message_id;
+                    self.request_id = old.request_id;
+                    self.chat_message_id = old.chat_message_id;
+                    // Clear the old streamer's streamer_id so it won't save
+                    // state to the disconnected map when it disconnects.
+                    old.streamer_id = None;
+                    // Close the old connection.
+                    let close_result =
+                        old.writer.lock().await.send(Message::Close(None)).await;
+                    if let Err(e) = close_result {
+                        debug!(
+                            "[{}] Error closing old connection [{}]: {}",
+                            self.peer_address, old.peer_address, e
+                        );
+                    }
+                } else {
+                    // Check disconnected streamers map.
+                    let mut map = self.disconnected_streamers.lock().await;
+                    if let Some((state, _)) = map.remove(streamer_id) {
+                        info!(
+                            "[{}] Restored state for streamer_id={}",
+                            self.peer_address, streamer_id
+                        );
+                        self.request_id = state.request_id;
+                        self.chat_message_id = state.chat_message_id;
+                    }
+                }
+                // Register this connection as the active one.
+                if let Some(me) = self.me.upgrade() {
+                    active.insert(streamer_id.clone(), me);
                 }
             }
             info!("[{}] Streamer successfully identified", self.peer_address);
@@ -256,6 +289,7 @@ impl Streamer {
 
     pub async fn save_state(&self) {
         if let Some(ref streamer_id) = self.streamer_id {
+            self.active_streamers.lock().await.remove(streamer_id);
             let state = StreamerState {
                 request_id: self.request_id,
                 chat_message_id: self.chat_message_id,
@@ -301,6 +335,7 @@ async fn handle_streamer_connection(
     stream: tokio::net::TcpStream,
     password: String,
     disconnected_streamers: DisconnectedStreamers,
+    active_streamers: ActiveStreamers,
 ) {
     let peer_address = stream
         .peer_addr()
@@ -326,6 +361,7 @@ async fn handle_streamer_connection(
         peer_address.clone(),
         writer.clone(),
         disconnected_streamers,
+        active_streamers,
     );
     streamer.lock().await.send_hello().await;
 
@@ -381,6 +417,7 @@ async fn main() {
     let args = Args::parse();
 
     let disconnected_streamers: DisconnectedStreamers = Arc::new(Mutex::new(HashMap::new()));
+    let active_streamers: ActiveStreamers = Arc::new(Mutex::new(HashMap::new()));
 
     // Periodically clean up expired disconnected streamer states.
     let cleanup_map = disconnected_streamers.clone();
@@ -416,6 +453,7 @@ async fn main() {
             stream,
             args.password.clone(),
             disconnected_streamers.clone(),
+            active_streamers.clone(),
         ));
     }
 }
