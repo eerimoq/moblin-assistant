@@ -43,13 +43,7 @@ const STREAMER_STATE_EXPIRY: std::time::Duration = std::time::Duration::from_hou
 
 const MAX_CHAT_HISTORY: usize = 100;
 
-struct StreamerState {
-    request_id: i32,
-    chat_message_id: i32,
-    chat_messages: VecDeque<ChatMessage>,
-}
-
-type DisconnectedStreamers = Arc<Mutex<HashMap<String, (StreamerState, Instant)>>>;
+type DisconnectedStreamers = Arc<Mutex<HashMap<String, (Arc<Mutex<Streamer>>, Instant)>>>;
 type ActiveStreamers = Arc<Mutex<HashMap<String, Weak<Mutex<Streamer>>>>>;
 
 pub(crate) struct Streamer {
@@ -62,10 +56,12 @@ pub(crate) struct Streamer {
     request_id: i32,
     chat_message_id: i32,
     chat_messages: VecDeque<ChatMessage>,
-    writer: WsWriter,
+    writer: Option<WsWriter>,
     streamer_id: Option<String>,
     disconnected_streamers: DisconnectedStreamers,
     active_streamers: ActiveStreamers,
+    pub(crate) twitch_running: bool,
+    pub(crate) youtube_running: bool,
 }
 
 impl Streamer {
@@ -87,10 +83,12 @@ impl Streamer {
                 request_id: 0,
                 chat_message_id: 0,
                 chat_messages: VecDeque::new(),
-                writer,
+                writer: Some(writer),
                 streamer_id: None,
                 disconnected_streamers,
                 active_streamers,
+                twitch_running: false,
+                youtube_running: false,
             })
         })
     }
@@ -126,6 +124,10 @@ impl Streamer {
         self.chat_messages.push_back(message);
     }
 
+    pub fn writer(&self) -> Option<WsWriter> {
+        self.writer.clone()
+    }
+
     pub async fn send_hello(&mut self) {
         let hello = MessageToStreamer::Hello(HelloMessage {
             api_version: API_VERSION.to_string(),
@@ -134,15 +136,17 @@ impl Streamer {
                 salt: self.salt.clone(),
             },
         });
-        let mut writer = self.writer.lock().await;
-        if let Err(e) = writer
-            .send(Message::Text(
-                serde_json::to_string(&hello).expect("Failed to serialize hello message"),
-            ))
-            .await
-        {
-            error!("[{}] Error sending hello: {}", self.peer_address, e);
-            return;
+        if let Some(ref writer) = self.writer {
+            let mut writer = writer.lock().await;
+            if let Err(e) = writer
+                .send(Message::Text(
+                    serde_json::to_string(&hello).expect("Failed to serialize hello message"),
+                ))
+                .await
+            {
+                error!("[{}] Error sending hello: {}", self.peer_address, e);
+                return;
+            }
         }
         debug!(
             "[{}] Sent hello message with authentication challenge",
@@ -150,10 +154,13 @@ impl Streamer {
         );
     }
 
-    pub async fn handle_message(&mut self, message: MessageToAssistant) -> Result<(), AnyError> {
+    pub async fn handle_message(
+        &mut self,
+        message: MessageToAssistant,
+    ) -> Result<Option<Arc<Mutex<Streamer>>>, AnyError> {
         match message {
             MessageToAssistant::Identify(identify) => {
-                self.handle_identify(identify).await?;
+                return self.handle_identify(identify).await;
             }
             MessageToAssistant::Ping(_) => {
                 self.handle_ping().await?;
@@ -171,12 +178,17 @@ impl Streamer {
                 self.handle_response().await;
             }
         }
-        Ok(())
+        Ok(None)
     }
 
-    pub async fn handle_identify(&mut self, identify: IdentifyMessage) -> Result<(), AnyError> {
+    pub async fn handle_identify(
+        &mut self,
+        identify: IdentifyMessage,
+    ) -> Result<Option<Arc<Mutex<Streamer>>>, AnyError> {
         debug!("[{}] Processing identify message", self.peer_address);
         let expected_hash = self.hash_password();
+
+        let mut reconnected_streamer: Option<Arc<Mutex<Streamer>>> = None;
 
         let result = if self.identified {
             debug!("[{}] Streamer already identified", self.peer_address);
@@ -200,29 +212,44 @@ impl Streamer {
                     // state to the disconnected map when it disconnects.
                     old.streamer_id = None;
                     // Close the old connection.
-                    let close_result =
-                        old.writer.lock().await.send(Message::Close(None)).await;
-                    if let Err(e) = close_result {
-                        debug!(
-                            "[{}] Error closing old connection [{}]: {}",
-                            self.peer_address, old.peer_address, e
-                        );
+                    if let Some(ref old_writer) = old.writer {
+                        let close_result =
+                            old_writer.lock().await.send(Message::Close(None)).await;
+                        if let Err(e) = close_result {
+                            debug!(
+                                "[{}] Error closing old connection [{}]: {}",
+                                self.peer_address, old.peer_address, e
+                            );
+                        }
                     }
+                    // Register this connection as the active one.
+                    active.insert(streamer_id.clone(), self.me.clone());
                 } else {
                     // Check disconnected streamers map.
                     let mut map = self.disconnected_streamers.lock().await;
-                    if let Some((state, _)) = map.remove(streamer_id) {
+                    if let Some((old_streamer, _)) = map.remove(streamer_id) {
+                        let mut old = old_streamer.lock().await;
                         info!(
                             "[{}] Restored state for streamer_id={}",
                             self.peer_address, streamer_id
                         );
-                        self.request_id = state.request_id;
-                        self.chat_message_id = state.chat_message_id;
-                        self.chat_messages = state.chat_messages;
+                        // Transfer writer to the old streamer so chat tasks
+                        // (which hold a reference to old_streamer) keep
+                        // using the same Arc.
+                        old.writer = self.writer.take();
+                        old.peer_address = self.peer_address.clone();
+                        old.identified = true;
+                        // Clear the new streamer's streamer_id so it won't
+                        // save state to the disconnected map when it drops.
+                        self.streamer_id = None;
+                        // Register the old streamer as the active one.
+                        active.insert(streamer_id.clone(), old.me.clone());
+                        reconnected_streamer = old.me.upgrade();
+                    } else {
+                        // No prior state; register this connection as active.
+                        active.insert(streamer_id.clone(), self.me.clone());
                     }
                 }
-                // Register this connection as the active one.
-                active.insert(streamer_id.clone(), self.me.clone());
             }
             info!("[{}] Streamer successfully identified", self.peer_address);
             IdentifiedResult::Ok {}
@@ -231,59 +258,92 @@ impl Streamer {
             IdentifiedResult::WrongPassword {}
         };
 
+        // Determine which streamer to send from (the reconnected one or self).
+        let writer = if let Some(ref rs) = reconnected_streamer {
+            rs.lock().await.writer()
+        } else {
+            self.writer()
+        };
+
         let identified = MessageToStreamer::Identified(IdentifiedMessage { result });
-        self.writer
-            .lock()
-            .await
-            .send(Message::Text(
-                serde_json::to_string(&identified)
-                    .expect("Failed to serialize identified response"),
-            ))
-            .await?;
+        if let Some(ref writer) = writer {
+            writer
+                .lock()
+                .await
+                .send(Message::Text(
+                    serde_json::to_string(&identified)
+                        .expect("Failed to serialize identified response"),
+                ))
+                .await?;
+        }
 
         // Send chat message history to the streamer.
-        if !self.chat_messages.is_empty() {
-            let messages: Vec<ChatMessage> = self.chat_messages.iter().cloned().collect();
-            let request_id = self.next_id();
-            let request = MessageToStreamer::Request(RequestMessage {
-                id: request_id,
-                data: RequestData::ChatMessages(ChatMessagesRequest {
-                    history: true,
-                    messages,
-                }),
-            });
-            if let Ok(encoded) = serde_json::to_string(&request) {
-                debug!(
-                    "[{}] Sending {} chat history messages",
-                    self.peer_address,
-                    self.chat_messages.len()
-                );
-                if let Err(e) = self
-                    .writer
-                    .lock()
-                    .await
-                    .send(Message::Text(encoded))
-                    .await
-                {
-                    error!(
-                        "[{}] Error sending chat history: {}",
-                        self.peer_address, e
+        let chat_messages = if let Some(ref rs) = reconnected_streamer {
+            let s = rs.lock().await;
+            if s.chat_messages.is_empty() {
+                None
+            } else {
+                Some((
+                    s.chat_messages.iter().cloned().collect::<Vec<ChatMessage>>(),
+                    s.chat_messages.len(),
+                ))
+            }
+        } else if !self.chat_messages.is_empty() {
+            Some((
+                self.chat_messages.iter().cloned().collect::<Vec<ChatMessage>>(),
+                self.chat_messages.len(),
+            ))
+        } else {
+            None
+        };
+
+        if let Some((messages, count)) = chat_messages {
+            if let Some(ref writer) = writer {
+                let request_id = if let Some(ref rs) = reconnected_streamer {
+                    rs.lock().await.next_id()
+                } else {
+                    self.next_id()
+                };
+                let request = MessageToStreamer::Request(RequestMessage {
+                    id: request_id,
+                    data: RequestData::ChatMessages(ChatMessagesRequest {
+                        history: true,
+                        messages,
+                    }),
+                });
+                if let Ok(encoded) = serde_json::to_string(&request) {
+                    debug!(
+                        "[{}] Sending {} chat history messages",
+                        self.peer_address, count
                     );
+                    if let Err(e) = writer
+                        .lock()
+                        .await
+                        .send(Message::Text(encoded))
+                        .await
+                    {
+                        error!(
+                            "[{}] Error sending chat history: {}",
+                            self.peer_address, e
+                        );
+                    }
                 }
             }
         }
 
-        Ok(())
+        Ok(reconnected_streamer)
     }
 
     pub async fn handle_ping(&mut self) -> Result<(), AnyError> {
         let pong = MessageToStreamer::Pong {};
-        let mut writer = self.writer.lock().await;
-        writer
-            .send(Message::Text(
-                serde_json::to_string(&pong).expect("Failed to serialize pong message"),
-            ))
-            .await?;
+        if let Some(ref writer) = self.writer {
+            let mut writer = writer.lock().await;
+            writer
+                .send(Message::Text(
+                    serde_json::to_string(&pong).expect("Failed to serialize pong message"),
+                ))
+                .await?;
+        }
         Ok(())
     }
 
@@ -298,11 +358,19 @@ impl Streamer {
         if !self.identified {
             return;
         }
+        if self.twitch_running {
+            info!(
+                "[{}] Twitch connection already running, ignoring start",
+                self.peer_address
+            );
+            return;
+        }
         if let Some(channel_name) = &twitch_start.channel_name {
             info!(
                 "[{}] Starting Twitch IRC connection for channel: {}",
                 self.peer_address, channel_name
             );
+            self.twitch_running = true;
             tokio::spawn(twitch::connect_twitch_irc(
                 self.me.clone(),
                 channel_name.to_lowercase(),
@@ -315,10 +383,18 @@ impl Streamer {
         if !self.identified {
             return;
         }
+        if self.youtube_running {
+            info!(
+                "[{}] YouTube connection already running, ignoring start",
+                self.peer_address
+            );
+            return;
+        }
         info!(
             "[{}] Starting YouTube chat for video: {}",
             self.peer_address, youtube_start.video_id
         );
+        self.youtube_running = true;
         tokio::spawn(youtube::connect_youtube_chat(
             self.me.clone(),
             youtube_start.video_id.clone(),
@@ -334,19 +410,20 @@ impl Streamer {
     }
 
     pub async fn save_state(&mut self) {
+        // Mark as disconnected by removing the writer.
+        self.writer = None;
         if let Some(ref streamer_id) = self.streamer_id {
             self.active_streamers.lock().await.remove(streamer_id);
-            let state = StreamerState {
-                request_id: self.request_id,
-                chat_message_id: self.chat_message_id,
-                chat_messages: std::mem::take(&mut self.chat_messages),
-            };
-            let mut map = self.disconnected_streamers.lock().await;
-            map.insert(streamer_id.clone(), (state, Instant::now()));
-            info!(
-                "[{}] Saved state for streamer_id={}",
-                self.peer_address, streamer_id
-            );
+            // Store this Streamer (via its Arc) in the disconnected map
+            // so that Twitch/YouTube tasks remain alive.
+            if let Some(arc) = self.me.upgrade() {
+                let mut map = self.disconnected_streamers.lock().await;
+                map.insert(streamer_id.clone(), (arc, Instant::now()));
+                info!(
+                    "[{}] Saved state for streamer_id={}",
+                    self.peer_address, streamer_id
+                );
+            }
         }
     }
 }
@@ -403,7 +480,7 @@ async fn handle_streamer_connection(
 
     let (write, mut read) = ws_stream.split();
     let writer = Arc::new(Mutex::new(write));
-    let streamer = Streamer::new(
+    let mut streamer = Streamer::new(
         password,
         peer_address.clone(),
         writer.clone(),
@@ -433,9 +510,19 @@ async fn handle_streamer_connection(
                     }
                 };
 
-                if let Err(e) = streamer.lock().await.handle_message(message).await {
-                    error!("[{peer_address}] Error handling WebSocket message: {e}");
-                    break;
+                let result = streamer.lock().await.handle_message(message).await;
+                match result {
+                    Ok(Some(reconnected)) => {
+                        // Streamer reconnected to a previous session;
+                        // switch to the old Streamer so chat tasks share
+                        // the same Arc.
+                        streamer = reconnected;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("[{peer_address}] Error handling WebSocket message: {e}");
+                        break;
+                    }
                 }
             }
             Message::Ping(data) => {

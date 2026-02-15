@@ -329,6 +329,7 @@ pub async fn connect_youtube_chat(
         }
     }
 
+    streamer.lock().await.youtube_running = false;
     debug!("[{peer_address}] YouTube chat connection ended");
 }
 
@@ -383,7 +384,7 @@ async fn youtube_chat_session(
                     let mut streamer = streamer.lock().await;
                     let chat_message_id = streamer.next_chat_message_id();
                     let request_id = streamer.next_id();
-                    let writer = streamer.writer.clone();
+                    let writer = streamer.writer();
 
                     let chat_message = ChatMessage {
                         id: chat_message_id,
@@ -406,20 +407,21 @@ async fn youtube_chat_session(
                     streamer.store_chat_message(chat_message.clone());
                     drop(streamer);
 
-                    let request = MessageToStreamer::Request(RequestMessage {
-                        id: request_id,
-                        data: RequestData::ChatMessages(ChatMessagesRequest {
-                            history: false,
-                            messages: vec![chat_message],
-                        }),
-                    });
+                    if let Some(writer) = writer {
+                        let request = MessageToStreamer::Request(RequestMessage {
+                            id: request_id,
+                            data: RequestData::ChatMessages(ChatMessagesRequest {
+                                history: false,
+                                messages: vec![chat_message],
+                            }),
+                        });
 
-                    if let Ok(encoded) = serde_json::to_string(&request) {
-                        debug!("[{peer_address}] Forwarding YouTube chat message: {encoded}");
-                        let mut writer = writer.lock().await;
-                        if let Err(e) = writer.send(tungstenite::Message::Text(encoded)).await {
-                            error!("[{peer_address}] Error forwarding YouTube chat message: {e}");
-                            return Ok(());
+                        if let Ok(encoded) = serde_json::to_string(&request) {
+                            debug!("[{peer_address}] Forwarding YouTube chat message: {encoded}");
+                            let mut writer = writer.lock().await;
+                            if let Err(e) = writer.send(tungstenite::Message::Text(encoded)).await {
+                                error!("[{peer_address}] Error forwarding YouTube chat message: {e}");
+                            }
                         }
                     }
 

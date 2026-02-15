@@ -93,6 +93,7 @@ pub async fn connect_twitch_irc(
 
     if let Err(e) = client.join(channel_name.clone()) {
         error!("[{peer_address}] Failed to join Twitch channel '{channel_name}': {e}");
+        streamer.lock().await.twitch_running = false;
         return;
     }
 
@@ -119,7 +120,7 @@ pub async fn connect_twitch_irc(
             let mut streamer = streamer.lock().await;
             let chat_message_id = streamer.next_chat_message_id();
             let request_id = streamer.next_id();
-            let writer = streamer.writer.clone();
+            let writer = streamer.writer();
 
             let chat_message = ChatMessage {
                 id: chat_message_id,
@@ -142,25 +143,27 @@ pub async fn connect_twitch_irc(
             streamer.store_chat_message(chat_message.clone());
             drop(streamer);
 
-            let request = MessageToStreamer::Request(RequestMessage {
-                id: request_id,
-                data: RequestData::ChatMessages(ChatMessagesRequest {
-                    history: false,
-                    messages: vec![chat_message],
-                }),
-            });
+            if let Some(writer) = writer {
+                let request = MessageToStreamer::Request(RequestMessage {
+                    id: request_id,
+                    data: RequestData::ChatMessages(ChatMessagesRequest {
+                        history: false,
+                        messages: vec![chat_message],
+                    }),
+                });
 
-            if let Ok(encoded) = serde_json::to_string(&request) {
-                debug!("[{peer_address}] Forwarding Twitch chat message: {encoded}");
-                let mut writer = writer.lock().await;
-                if let Err(e) = writer.send(Message::Text(encoded)).await {
-                    error!("[{peer_address}] Error forwarding chat message: {e}");
-                    return;
+                if let Ok(encoded) = serde_json::to_string(&request) {
+                    debug!("[{peer_address}] Forwarding Twitch chat message: {encoded}");
+                    let mut writer = writer.lock().await;
+                    if let Err(e) = writer.send(Message::Text(encoded)).await {
+                        error!("[{peer_address}] Error forwarding chat message: {e}");
+                    }
                 }
             }
         }
     }
 
+    streamer.lock().await.twitch_running = false;
     debug!("[{peer_address}] Twitch IRC connection ended");
 }
 
