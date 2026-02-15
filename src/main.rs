@@ -37,7 +37,7 @@ struct Args {
     port: u16,
 }
 
-const STREAMER_STATE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+const STREAMER_STATE_EXPIRY: std::time::Duration = std::time::Duration::from_hours(12);
 
 struct StreamerState {
     request_id: i32,
@@ -385,7 +385,7 @@ async fn main() {
     // Periodically clean up expired disconnected streamer states.
     let cleanup_map = disconnected_streamers.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_hours(1));
         loop {
             interval.tick().await;
             let mut map = cleanup_map.lock().await;
