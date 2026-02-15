@@ -120,7 +120,6 @@ pub async fn connect_twitch_irc(
             let chat_message_id = streamer.next_chat_message_id();
             let request_id = streamer.next_id();
             let writer = streamer.writer.clone();
-            drop(streamer);
 
             let chat_message = ChatMessage {
                 id: chat_message_id,
@@ -139,6 +138,9 @@ pub async fn connect_twitch_irc(
                 is_owner,
                 bits: message.bits.map(|b| b.to_string()),
             };
+
+            streamer.store_chat_message(chat_message.clone());
+            drop(streamer);
 
             let request = MessageToStreamer::Request(RequestMessage {
                 id: request_id,

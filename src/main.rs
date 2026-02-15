@@ -8,6 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -16,8 +17,9 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use protocol::{
-    Authentication, HelloMessage, IdentifiedMessage, IdentifiedResult, IdentifyMessage,
-    MessageToAssistant, MessageToStreamer, TwitchStartMessage, YouTubeStartMessage, API_VERSION,
+    Authentication, ChatMessage, ChatMessagesRequest, HelloMessage, IdentifiedMessage,
+    IdentifiedResult, IdentifyMessage, MessageToAssistant, MessageToStreamer, RequestData,
+    RequestMessage, TwitchStartMessage, YouTubeStartMessage, API_VERSION,
 };
 
 const DEFAULT_PORT: u16 = 2345;
@@ -39,9 +41,12 @@ struct Args {
 
 const STREAMER_STATE_EXPIRY: std::time::Duration = std::time::Duration::from_hours(12);
 
+const MAX_CHAT_HISTORY: usize = 100;
+
 struct StreamerState {
     request_id: i32,
     chat_message_id: i32,
+    chat_messages: VecDeque<ChatMessage>,
 }
 
 type DisconnectedStreamers = Arc<Mutex<HashMap<String, (StreamerState, Instant)>>>;
@@ -56,6 +61,7 @@ pub(crate) struct Streamer {
     pub identified: bool,
     request_id: i32,
     chat_message_id: i32,
+    chat_messages: VecDeque<ChatMessage>,
     writer: WsWriter,
     streamer_id: Option<String>,
     disconnected_streamers: DisconnectedStreamers,
@@ -80,6 +86,7 @@ impl Streamer {
                 identified: false,
                 request_id: 0,
                 chat_message_id: 0,
+                chat_messages: VecDeque::new(),
                 writer,
                 streamer_id: None,
                 disconnected_streamers,
@@ -110,6 +117,13 @@ impl Streamer {
     pub fn next_chat_message_id(&mut self) -> i32 {
         self.chat_message_id += 1;
         self.chat_message_id
+    }
+
+    pub fn store_chat_message(&mut self, message: ChatMessage) {
+        if self.chat_messages.len() >= MAX_CHAT_HISTORY {
+            self.chat_messages.pop_front();
+        }
+        self.chat_messages.push_back(message);
     }
 
     pub async fn send_hello(&mut self) {
@@ -181,6 +195,7 @@ impl Streamer {
                     );
                     self.request_id = old.request_id;
                     self.chat_message_id = old.chat_message_id;
+                    self.chat_messages = std::mem::take(&mut old.chat_messages);
                     // Clear the old streamer's streamer_id so it won't save
                     // state to the disconnected map when it disconnects.
                     old.streamer_id = None;
@@ -203,6 +218,7 @@ impl Streamer {
                         );
                         self.request_id = state.request_id;
                         self.chat_message_id = state.chat_message_id;
+                        self.chat_messages = state.chat_messages;
                     }
                 }
                 // Register this connection as the active one.
@@ -224,6 +240,38 @@ impl Streamer {
                     .expect("Failed to serialize identified response"),
             ))
             .await?;
+
+        // Send chat message history to the streamer.
+        if !self.chat_messages.is_empty() {
+            let messages: Vec<ChatMessage> = self.chat_messages.iter().cloned().collect();
+            let request_id = self.next_id();
+            let request = MessageToStreamer::Request(RequestMessage {
+                id: request_id,
+                data: RequestData::ChatMessages(ChatMessagesRequest {
+                    history: true,
+                    messages,
+                }),
+            });
+            if let Ok(encoded) = serde_json::to_string(&request) {
+                debug!(
+                    "[{}] Sending {} chat history messages",
+                    self.peer_address,
+                    self.chat_messages.len()
+                );
+                if let Err(e) = self
+                    .writer
+                    .lock()
+                    .await
+                    .send(Message::Text(encoded))
+                    .await
+                {
+                    error!(
+                        "[{}] Error sending chat history: {}",
+                        self.peer_address, e
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -285,12 +333,13 @@ impl Streamer {
         debug!("[{}] Received response from streamer", self.peer_address);
     }
 
-    pub async fn save_state(&self) {
+    pub async fn save_state(&mut self) {
         if let Some(ref streamer_id) = self.streamer_id {
             self.active_streamers.lock().await.remove(streamer_id);
             let state = StreamerState {
                 request_id: self.request_id,
                 chat_message_id: self.chat_message_id,
+                chat_messages: std::mem::take(&mut self.chat_messages),
             };
             let mut map = self.disconnected_streamers.lock().await;
             map.insert(streamer_id.clone(), (state, Instant::now()));
