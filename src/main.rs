@@ -235,7 +235,9 @@ impl Streamer {
                         );
                         // Transfer writer to the old streamer so chat tasks
                         // (which hold a reference to old_streamer) keep
-                        // using the same Arc.
+                        // using the same Arc. After this, `self` (the new
+                        // streamer) is abandoned and the caller will switch
+                        // to using the returned reconnected streamer.
                         old.writer = self.writer.take();
                         old.peer_address = self.peer_address.clone();
                         old.identified = true;
