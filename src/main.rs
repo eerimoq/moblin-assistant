@@ -45,7 +45,7 @@ struct StreamerState {
 }
 
 type DisconnectedStreamers = Arc<Mutex<HashMap<String, (StreamerState, Instant)>>>;
-type ActiveStreamers = Arc<Mutex<HashMap<String, Arc<Mutex<Streamer>>>>>;
+type ActiveStreamers = Arc<Mutex<HashMap<String, Weak<Mutex<Streamer>>>>>;
 
 pub(crate) struct Streamer {
     me: Weak<Mutex<Self>>,
@@ -173,7 +173,7 @@ impl Streamer {
             if let Some(ref streamer_id) = identify.streamer_id {
                 // Check if this streamerId is already actively connected.
                 let mut active = self.active_streamers.lock().await;
-                if let Some(old_streamer) = active.remove(streamer_id) {
+                if let Some(old_streamer) = active.remove(streamer_id).and_then(|w| w.upgrade()) {
                     let mut old = old_streamer.lock().await;
                     info!(
                         "[{}] Taking over from active connection [{}] for streamer_id={}",
@@ -206,9 +206,7 @@ impl Streamer {
                     }
                 }
                 // Register this connection as the active one.
-                if let Some(me) = self.me.upgrade() {
-                    active.insert(streamer_id.clone(), me);
-                }
+                active.insert(streamer_id.clone(), self.me.clone());
             }
             info!("[{}] Streamer successfully identified", self.peer_address);
             IdentifiedResult::Ok {}
