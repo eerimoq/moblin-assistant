@@ -1,17 +1,12 @@
-use futures_util::SinkExt;
-use log::{debug, error, info};
-use std::sync::Weak;
+use log::{error, info};
+use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
 use twitch_irc::login::StaticLoginCredentials;
 use twitch_irc::message::{Emote, ServerMessage};
 use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
-use crate::protocol::{
-    ChatMessage, ChatMessagesRequest, ChatPostSegment, MessageToStreamer, Platform, RequestData,
-    RequestMessage, RgbColor,
-};
-use crate::Streamer;
+use crate::protocol::{ChatMessage, ChatPostSegment, Platform, RgbColor};
+use crate::streamer::StreamerState;
 
 fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostSegment> {
     let mut segments: Vec<ChatPostSegment> = Vec::new();
@@ -46,7 +41,6 @@ fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostS
             url: Some(emote_url),
         });
         id += 1;
-        // Empty text spacer segment after emote, matching Moblin's protocol
         segments.push(ChatPostSegment {
             id,
             text: Some(String::new()),
@@ -77,15 +71,10 @@ fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostS
 }
 
 pub async fn connect_twitch_irc(
-    streamer: Weak<Mutex<Streamer>>,
+    streamer: Arc<Mutex<StreamerState>>,
     channel_name: String,
     peer_address: String,
 ) {
-    let Some(streamer) = streamer.upgrade() else {
-        return;
-    };
-    info!("[{peer_address}] Connecting to Twitch IRC for channel: {channel_name}");
-
     let credentials = StaticLoginCredentials::anonymous();
     let config = ClientConfig::new_simple(credentials);
     let (mut messages, client) =
@@ -93,6 +82,7 @@ pub async fn connect_twitch_irc(
 
     if let Err(e) = client.join(channel_name.clone()) {
         error!("[{peer_address}] Failed to join Twitch channel '{channel_name}': {e}");
+        streamer.lock().await.twitch_running = false;
         return;
     }
 
@@ -105,24 +95,19 @@ pub async fn connect_twitch_irc(
                 green: c.g as i32,
                 blue: c.b as i32,
             });
-
             let user_badges: Vec<String> = message
                 .badges
                 .iter()
                 .map(|b| format!("{}/{}", b.name, b.version))
                 .collect();
-
             let is_moderator = message.badges.iter().any(|b| b.name == "moderator");
             let is_subscriber = message.badges.iter().any(|b| b.name == "subscriber");
             let is_owner = message.badges.iter().any(|b| b.name == "broadcaster");
 
             let mut streamer = streamer.lock().await;
-            let chat_message_id = streamer.next_chat_message_id();
-            let request_id = streamer.next_id();
-            let writer = streamer.writer.clone();
 
-            let chat_message = ChatMessage {
-                id: chat_message_id,
+            let message = ChatMessage {
+                id: streamer.next_chat_message_id(),
                 platform: Platform::Twitch {},
                 message_id: Some(message.message_id.clone()),
                 display_name: Some(message.sender.name.clone()),
@@ -136,32 +121,15 @@ pub async fn connect_twitch_irc(
                 is_moderator,
                 is_subscriber,
                 is_owner,
-                bits: message.bits.map(|b| b.to_string()),
+                bits: message.bits.map(|bits| bits.to_string()),
             };
 
-            streamer.store_chat_message(chat_message.clone());
-            drop(streamer);
-
-            let request = MessageToStreamer::Request(RequestMessage {
-                id: request_id,
-                data: RequestData::ChatMessages(ChatMessagesRequest {
-                    history: false,
-                    messages: vec![chat_message],
-                }),
-            });
-
-            if let Ok(encoded) = serde_json::to_string(&request) {
-                debug!("[{peer_address}] Forwarding Twitch chat message: {encoded}");
-                let mut writer = writer.lock().await;
-                if let Err(e) = writer.send(Message::Text(encoded)).await {
-                    error!("[{peer_address}] Error forwarding chat message: {e}");
-                    return;
-                }
-            }
+            streamer.append_chat_message(message).await;
         }
     }
 
-    debug!("[{peer_address}] Twitch IRC connection ended");
+    streamer.lock().await.twitch_running = false;
+    info!("[{peer_address}] Twitch IRC connection ended");
 }
 
 #[cfg(test)]
@@ -204,7 +172,6 @@ mod tests {
             code: "Kappa".to_string(),
         }];
         let segments = create_twitch_segments("hello Kappa world", &emotes);
-        // "hello " -> text, Kappa -> url + spacer, " world" -> text
         assert_eq!(segments.len(), 4);
         assert_eq!(segments[0].text.as_deref(), Some("hello "));
         assert!(segments[1].url.is_some());
@@ -214,7 +181,6 @@ mod tests {
 
     #[test]
     fn test_multiple_emotes() {
-        // "Kappa Keepo Kappa"
         let emotes = vec![
             Emote {
                 id: "25".to_string(),
@@ -249,7 +215,6 @@ mod tests {
 
     #[test]
     fn test_emote_with_unicode() {
-        // "👉 <3 test" - emoji is one char, then space, then <3 emote
         let emotes = vec![Emote {
             id: "483".to_string(),
             char_range: 2..4,

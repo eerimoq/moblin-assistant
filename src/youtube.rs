@@ -1,15 +1,10 @@
-use futures_util::SinkExt;
-use log::{debug, error, info};
+use log::{error, info};
 use serde::Deserialize;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite;
 
-use crate::protocol::{
-    ChatMessage, ChatMessagesRequest, ChatPostSegment, MessageToStreamer, Platform, RequestData,
-    RequestMessage,
-};
-use crate::Streamer;
+use crate::protocol::{ChatMessage, ChatPostSegment, Platform};
+use crate::streamer::StreamerState;
 
 const YOUTUBE_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0";
@@ -302,21 +297,16 @@ async fn youtube_fetch_messages(
 }
 
 pub async fn connect_youtube_chat(
-    streamer: Weak<Mutex<Streamer>>,
+    streamer: Arc<Mutex<StreamerState>>,
     video_id: String,
     peer_address: String,
 ) {
-    let Some(streamer) = streamer.upgrade() else {
-        return;
-    };
     info!("[{peer_address}] Starting YouTube chat for video: {video_id}");
-
     let client = reqwest::Client::new();
 
     loop {
         match youtube_chat_session(&client, &streamer, &video_id, &peer_address).await {
             Ok(()) => {
-                debug!("[{peer_address}] YouTube chat session ended normally");
                 break;
             }
             Err(e) => {
@@ -329,12 +319,13 @@ pub async fn connect_youtube_chat(
         }
     }
 
-    debug!("[{peer_address}] YouTube chat connection ended");
+    streamer.lock().await.youtube_running = false;
+    info!("[{peer_address}] YouTube chat connection ended");
 }
 
 async fn youtube_chat_session(
     client: &reqwest::Client,
-    streamer: &Arc<Mutex<Streamer>>,
+    streamer: &Arc<Mutex<StreamerState>>,
     video_id: &str,
     peer_address: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -381,12 +372,9 @@ async fn youtube_chat_session(
                     let display_name = chat_description.author_name.simple_text.clone();
 
                     let mut streamer = streamer.lock().await;
-                    let chat_message_id = streamer.next_chat_message_id();
-                    let request_id = streamer.next_id();
-                    let writer = streamer.writer.clone();
 
-                    let chat_message = ChatMessage {
-                        id: chat_message_id,
+                    let message = ChatMessage {
+                        id: streamer.next_chat_message_id(),
                         platform: Platform::YouTube {},
                         message_id: None,
                         display_name: Some(display_name.clone()),
@@ -403,32 +391,12 @@ async fn youtube_chat_session(
                         bits: None,
                     };
 
-                    streamer.store_chat_message(chat_message.clone());
-                    drop(streamer);
-
-                    let request = MessageToStreamer::Request(RequestMessage {
-                        id: request_id,
-                        data: RequestData::ChatMessages(ChatMessagesRequest {
-                            history: false,
-                            messages: vec![chat_message],
-                        }),
-                    });
-
-                    if let Ok(encoded) = serde_json::to_string(&request) {
-                        debug!("[{peer_address}] Forwarding YouTube chat message: {encoded}");
-                        let mut writer = writer.lock().await;
-                        if let Err(e) = writer.send(tungstenite::Message::Text(encoded)).await {
-                            error!("[{peer_address}] Error forwarding YouTube chat message: {e}");
-                            return Ok(());
-                        }
-                    }
-
+                    streamer.append_chat_message(message).await;
                     message_count += 1;
                 }
             }
         }
 
-        // Update continuation
         let new_continuation = live_chat
             .continuation_contents
             .live_chat_continuation
@@ -442,7 +410,6 @@ async fn youtube_chat_session(
             .ok_or("No continuation token in YouTube response")?;
         continuation = new_continuation;
 
-        // Adaptive polling delay
         if message_count > 0 {
             delay_ms = delay_ms * 5 / message_count as u64;
         } else {
