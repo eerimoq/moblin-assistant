@@ -7,9 +7,11 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -35,6 +37,15 @@ struct Args {
     port: u16,
 }
 
+const STREAMER_STATE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
+struct StreamerState {
+    request_id: i32,
+    chat_message_id: i32,
+}
+
+type DisconnectedStreamers = Arc<Mutex<HashMap<String, (StreamerState, Instant)>>>;
+
 pub(crate) struct Streamer {
     me: Weak<Mutex<Self>>,
     password: String,
@@ -45,10 +56,17 @@ pub(crate) struct Streamer {
     request_id: i32,
     chat_message_id: i32,
     writer: WsWriter,
+    streamer_id: Option<String>,
+    disconnected_streamers: DisconnectedStreamers,
 }
 
 impl Streamer {
-    fn new(password: String, peer_address: String, writer: WsWriter) -> Arc<Mutex<Self>> {
+    fn new(
+        password: String,
+        peer_address: String,
+        writer: WsWriter,
+        disconnected_streamers: DisconnectedStreamers,
+    ) -> Arc<Mutex<Self>> {
         Arc::new_cyclic(|me| {
             Mutex::new(Self {
                 me: me.clone(),
@@ -60,6 +78,8 @@ impl Streamer {
                 request_id: 0,
                 chat_message_id: 0,
                 writer,
+                streamer_id: None,
+                disconnected_streamers,
             })
         })
     }
@@ -145,6 +165,18 @@ impl Streamer {
             IdentifiedResult::AlreadyIdentified {}
         } else if identify.authentication == expected_hash {
             self.identified = true;
+            self.streamer_id = identify.streamer_id.clone();
+            if let Some(ref streamer_id) = identify.streamer_id {
+                let mut map = self.disconnected_streamers.lock().await;
+                if let Some((state, _)) = map.remove(streamer_id) {
+                    info!(
+                        "[{}] Restored state for streamer_id={}",
+                        self.peer_address, streamer_id
+                    );
+                    self.request_id = state.request_id;
+                    self.chat_message_id = state.chat_message_id;
+                }
+            }
             info!("[{}] Streamer successfully identified", self.peer_address);
             IdentifiedResult::Ok {}
         } else {
@@ -221,6 +253,21 @@ impl Streamer {
         }
         debug!("[{}] Received response from streamer", self.peer_address);
     }
+
+    pub async fn save_state(&self) {
+        if let Some(ref streamer_id) = self.streamer_id {
+            let state = StreamerState {
+                request_id: self.request_id,
+                chat_message_id: self.chat_message_id,
+            };
+            let mut map = self.disconnected_streamers.lock().await;
+            map.insert(streamer_id.clone(), (state, Instant::now()));
+            info!(
+                "[{}] Saved state for streamer_id={}",
+                self.peer_address, streamer_id
+            );
+        }
+    }
 }
 
 fn random_string() -> String {
@@ -250,7 +297,11 @@ async fn handle_websocket_ping(
     Ok(())
 }
 
-async fn handle_streamer_connection(stream: tokio::net::TcpStream, password: String) {
+async fn handle_streamer_connection(
+    stream: tokio::net::TcpStream,
+    password: String,
+    disconnected_streamers: DisconnectedStreamers,
+) {
     let peer_address = stream
         .peer_addr()
         .expect("Failed to get peer address")
@@ -270,7 +321,12 @@ async fn handle_streamer_connection(stream: tokio::net::TcpStream, password: Str
 
     let (write, mut read) = ws_stream.split();
     let writer = Arc::new(Mutex::new(write));
-    let streamer = Streamer::new(password, peer_address.clone(), writer.clone());
+    let streamer = Streamer::new(
+        password,
+        peer_address.clone(),
+        writer.clone(),
+        disconnected_streamers,
+    );
     streamer.lock().await.send_hello().await;
 
     while let Some(message) = read.next().await {
@@ -315,6 +371,7 @@ async fn handle_streamer_connection(stream: tokio::net::TcpStream, password: Str
         }
     }
 
+    streamer.lock().await.save_state().await;
     info!("[{peer_address}] Streamer disconnected");
 }
 
@@ -322,6 +379,25 @@ async fn handle_streamer_connection(stream: tokio::net::TcpStream, password: Str
 async fn main() {
     env_logger::init();
     let args = Args::parse();
+
+    let disconnected_streamers: DisconnectedStreamers = Arc::new(Mutex::new(HashMap::new()));
+
+    // Periodically clean up expired disconnected streamer states.
+    let cleanup_map = disconnected_streamers.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            let mut map = cleanup_map.lock().await;
+            map.retain(|id, (_, saved_at)| {
+                let expired = saved_at.elapsed() >= STREAMER_STATE_EXPIRY;
+                if expired {
+                    info!("Removing expired state for streamer_id={}", id);
+                }
+                !expired
+            });
+        }
+    });
 
     let address = format!("0.0.0.0:{}", args.port);
     info!("Starting server on {}", address);
@@ -336,6 +412,10 @@ async fn main() {
             .await
             .expect("Failed to accept connection");
         debug!("Accepted TCP connection from {addr}");
-        tokio::spawn(handle_streamer_connection(stream, args.password.clone()));
+        tokio::spawn(handle_streamer_connection(
+            stream,
+            args.password.clone(),
+            disconnected_streamers.clone(),
+        ));
     }
 }
