@@ -99,6 +99,8 @@ pub struct RequestMessage {
 #[serde(rename_all = "camelCase")]
 pub struct IdentifyMessage {
     pub authentication: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streamer_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +148,20 @@ mod tests {
         match msg {
             MessageToAssistant::Identify(data) => {
                 assert_eq!(data.authentication, "abc123");
+                assert!(data.streamer_id.is_none());
+            }
+            _ => panic!("Expected Identify variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_identify_message_with_streamer_id() {
+        let json = r#"{"identify": {"authentication": "abc123", "streamerId": "streamer-42"}}"#;
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
+        match msg {
+            MessageToAssistant::Identify(data) => {
+                assert_eq!(data.authentication, "abc123");
+                assert_eq!(data.streamer_id.as_deref(), Some("streamer-42"));
             }
             _ => panic!("Expected Identify variant"),
         }
