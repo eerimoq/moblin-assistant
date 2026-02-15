@@ -8,7 +8,8 @@ A Rust implementation of the Moblin remote control assistant server. This server
 - Connection setup with challenge-response authentication (SHA256-based)
 - Identification using password hashing with salt and challenge
 - Ping/pong keep-alive mechanism
-- Hardcoded chat message sending to connected streamers
+- Twitch chat ingestion and forwarding to Moblin
+- YouTube live chat ingestion and forwarding to Moblin
 
 ## Building
 
@@ -64,7 +65,8 @@ The server implements the Moblin remote control protocol:
 2. **Identify**: Client sends hashed password for authentication
 3. **Identified**: Server confirms authentication status
 4. **Ping/Pong**: Keep-alive mechanism
-5. **Chat Messages**: Server can send chat messages to the streamer
+5. **TwitchStart/YouTubeStart**: Streamer requests external chat bridge setup
+6. **Chat Messages**: Assistant forwards Twitch/YouTube messages to the streamer
 
 ## Example
 
@@ -75,7 +77,7 @@ The server implements the Moblin remote control protocol:
 
 2. Connect your Moblin app to the server using the IP address and password
 
-3. The server will send hardcoded chat messages after successful authentication
+3. Start Twitch and/or YouTube chat from the app and incoming messages are forwarded to Moblin
 
 ## Reference Implementation
 
