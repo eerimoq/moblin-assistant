@@ -1,15 +1,15 @@
 use futures_util::SinkExt;
 use log::{debug, error, info};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite;
 
 use crate::protocol::{
-    ChatMessage, ChatMessagesRequest, ChatPostSegment, OutgoingMessage, Platform, RequestData,
+    ChatMessage, ChatMessagesRequest, ChatPostSegment, MessageToStreamer, Platform, RequestData,
     RequestMessage,
 };
-use crate::{Streamer, WsWriter};
+use crate::Streamer;
 
 const YOUTUBE_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0";
@@ -19,124 +19,122 @@ const YOUTUBE_MAX_POLL_DELAY_MS: u64 = 3000;
 const YOUTUBE_RECONNECT_DELAY_SECS: u64 = 5;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct YtThumbnail {
+struct Thumbnail {
     pub url: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct YtImage {
-    pub thumbnails: Vec<YtThumbnail>,
+struct Image {
+    pub thumbnails: Vec<Thumbnail>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct YtEmoji {
-    pub image: YtImage,
+struct Emoji {
+    pub image: Image,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct YtRun {
+struct Run {
     pub text: Option<String>,
-    pub emoji: Option<YtEmoji>,
+    pub emoji: Option<Emoji>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct YtMessage {
-    pub runs: Vec<YtRun>,
+struct Message {
+    pub runs: Vec<Run>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct YtAuthor {
+struct Author {
     pub simple_text: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct YtAmount {
+struct Amount {
     #[allow(dead_code)]
     pub simple_text: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct YtBadgeIcon {
+struct BadgeIcon {
     pub icon_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct YtAuthorBadgeRenderer {
-    pub icon: Option<YtBadgeIcon>,
+struct AuthorBadgeRenderer {
+    pub icon: Option<BadgeIcon>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct YtAuthorBadge {
-    pub live_chat_author_badge_renderer: Option<YtAuthorBadgeRenderer>,
+struct AuthorBadge {
+    pub live_chat_author_badge_renderer: Option<AuthorBadgeRenderer>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct YtChatDescription {
-    pub author_name: YtAuthor,
-    pub message: Option<YtMessage>,
+struct ChatDescription {
+    pub author_name: Author,
+    pub message: Option<Message>,
     #[allow(dead_code)]
-    pub purchase_amount_text: Option<YtAmount>,
-    pub header_subtext: Option<YtMessage>,
-    pub author_badges: Option<Vec<YtAuthorBadge>>,
+    pub purchase_amount_text: Option<Amount>,
+    pub header_subtext: Option<Message>,
+    pub author_badges: Option<Vec<AuthorBadge>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct YtAddChatItemActionItem {
-    live_chat_text_message_renderer: Option<YtChatDescription>,
-    live_chat_paid_message_renderer: Option<YtChatDescription>,
-    live_chat_paid_sticker_renderer: Option<YtChatDescription>,
-    live_chat_membership_item_renderer: Option<YtChatDescription>,
+struct AddChatItemActionItem {
+    live_chat_text_message_renderer: Option<ChatDescription>,
+    live_chat_paid_message_renderer: Option<ChatDescription>,
+    live_chat_paid_sticker_renderer: Option<ChatDescription>,
+    live_chat_membership_item_renderer: Option<ChatDescription>,
 }
 
 #[derive(Debug, Deserialize)]
-struct YtAddChatItemAction {
-    item: YtAddChatItemActionItem,
+struct AddChatItemAction {
+    item: AddChatItemActionItem,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct YtAction {
-    add_chat_item_action: Option<YtAddChatItemAction>,
+struct Action {
+    add_chat_item_action: Option<AddChatItemAction>,
 }
 
 #[derive(Debug, Deserialize)]
-struct YtInvalidationContinuationData {
+struct InvalidationContinuationData {
     continuation: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct YtContinuations {
-    invalidation_continuation_data: Option<YtInvalidationContinuationData>,
+struct Continuations {
+    invalidation_continuation_data: Option<InvalidationContinuationData>,
 }
 
 #[derive(Debug, Deserialize)]
-struct YtLiveChatContinuation {
-    continuations: Vec<YtContinuations>,
-    actions: Option<Vec<YtAction>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct YtContinuationContents {
-    live_chat_continuation: YtLiveChatContinuation,
+struct LiveChatContinuation {
+    continuations: Vec<Continuations>,
+    actions: Option<Vec<Action>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct YtGetLiveChat {
-    continuation_contents: YtContinuationContents,
+struct ContinuationContents {
+    live_chat_continuation: LiveChatContinuation,
 }
 
-pub(crate) fn create_youtube_segments(
-    chat_description: &YtChatDescription,
-) -> Vec<ChatPostSegment> {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetLiveChat {
+    continuation_contents: ContinuationContents,
+}
+
+fn create_youtube_segments(chat_description: &ChatDescription) -> Vec<ChatPostSegment> {
     let mut segments: Vec<ChatPostSegment> = Vec::new();
     let mut id: i32 = 0;
 
@@ -193,7 +191,7 @@ pub(crate) fn create_youtube_segments(
     segments
 }
 
-pub(crate) fn is_youtube_owner(chat_description: &YtChatDescription) -> bool {
+fn is_youtube_owner(chat_description: &ChatDescription) -> bool {
     chat_description
         .author_badges
         .as_ref()
@@ -209,7 +207,7 @@ pub(crate) fn is_youtube_owner(chat_description: &YtChatDescription) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn is_youtube_moderator(chat_description: &YtChatDescription) -> bool {
+fn is_youtube_moderator(chat_description: &ChatDescription) -> bool {
     chat_description
         .author_badges
         .as_ref()
@@ -225,7 +223,7 @@ pub(crate) fn is_youtube_moderator(chat_description: &YtChatDescription) -> bool
         .unwrap_or(false)
 }
 
-fn is_youtube_member(chat_description: &YtChatDescription) -> bool {
+fn is_youtube_member(chat_description: &ChatDescription) -> bool {
     chat_description
         .author_badges
         .as_ref()
@@ -272,7 +270,7 @@ async fn youtube_get_initial_continuation(
 async fn youtube_fetch_messages(
     client: &reqwest::Client,
     continuation: &str,
-) -> Result<YtGetLiveChat, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<GetLiveChat, Box<dyn std::error::Error + Send + Sync>> {
     let url = "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat";
     let body = serde_json::json!({
         "context": {
@@ -299,22 +297,24 @@ async fn youtube_fetch_messages(
         .into());
     }
 
-    let data: YtGetLiveChat = response.json().await?;
+    let data: GetLiveChat = response.json().await?;
     Ok(data)
 }
 
 pub async fn connect_youtube_chat(
-    writer: WsWriter,
-    streamer: Arc<Mutex<Streamer>>,
+    streamer: Weak<Mutex<Streamer>>,
     video_id: String,
     peer_address: String,
 ) {
+    let Some(streamer) = streamer.upgrade() else {
+        return;
+    };
     info!("[{peer_address}] Starting YouTube chat for video: {video_id}");
 
     let client = reqwest::Client::new();
 
     loop {
-        match youtube_chat_session(&client, &writer, &streamer, &video_id, &peer_address).await {
+        match youtube_chat_session(&client, &streamer, &video_id, &peer_address).await {
             Ok(()) => {
                 debug!("[{peer_address}] YouTube chat session ended normally");
                 break;
@@ -334,7 +334,6 @@ pub async fn connect_youtube_chat(
 
 async fn youtube_chat_session(
     client: &reqwest::Client,
-    writer: &WsWriter,
     streamer: &Arc<Mutex<Streamer>>,
     video_id: &str,
     peer_address: &str,
@@ -360,7 +359,7 @@ async fn youtube_chat_session(
                     None => continue,
                 };
 
-                let descriptions: Vec<&YtChatDescription> = [
+                let descriptions: Vec<&ChatDescription> = [
                     item.live_chat_text_message_renderer.as_ref(),
                     item.live_chat_paid_message_renderer.as_ref(),
                     item.live_chat_paid_sticker_renderer.as_ref(),
@@ -384,6 +383,7 @@ async fn youtube_chat_session(
                     let mut streamer = streamer.lock().await;
                     let chat_message_id = streamer.next_chat_message_id();
                     let request_id = streamer.next_id();
+                    let writer = streamer.writer.clone();
                     drop(streamer);
 
                     let chat_message = ChatMessage {
@@ -404,7 +404,7 @@ async fn youtube_chat_session(
                         bits: None,
                     };
 
-                    let request = OutgoingMessage::Request(RequestMessage {
+                    let request = MessageToStreamer::Request(RequestMessage {
                         id: request_id,
                         data: RequestData::ChatMessages(ChatMessagesRequest {
                             history: false,
@@ -414,8 +414,8 @@ async fn youtube_chat_session(
 
                     if let Ok(encoded) = serde_json::to_string(&request) {
                         debug!("[{peer_address}] Forwarding YouTube chat message: {encoded}");
-                        let mut w = writer.lock().await;
-                        if let Err(e) = w.send(Message::Text(encoded)).await {
+                        let mut writer = writer.lock().await;
+                        if let Err(e) = writer.send(tungstenite::Message::Text(encoded)).await {
                             error!("[{peer_address}] Error forwarding YouTube chat message: {e}");
                             return Ok(());
                         }
@@ -458,12 +458,12 @@ mod tests {
 
     #[test]
     fn test_youtube_segments_text_only() {
-        let desc = YtChatDescription {
-            author_name: YtAuthor {
+        let desc = ChatDescription {
+            author_name: Author {
                 simple_text: "TestUser".to_string(),
             },
-            message: Some(YtMessage {
-                runs: vec![YtRun {
+            message: Some(Message {
+                runs: vec![Run {
                     text: Some("hello world".to_string()),
                     emoji: None,
                 }],
@@ -480,27 +480,27 @@ mod tests {
 
     #[test]
     fn test_youtube_segments_with_emoji() {
-        let desc = YtChatDescription {
-            author_name: YtAuthor {
+        let desc = ChatDescription {
+            author_name: Author {
                 simple_text: "TestUser".to_string(),
             },
-            message: Some(YtMessage {
+            message: Some(Message {
                 runs: vec![
-                    YtRun {
+                    Run {
                         text: Some("hi ".to_string()),
                         emoji: None,
                     },
-                    YtRun {
+                    Run {
                         text: None,
-                        emoji: Some(YtEmoji {
-                            image: YtImage {
-                                thumbnails: vec![YtThumbnail {
+                        emoji: Some(Emoji {
+                            image: Image {
+                                thumbnails: vec![Thumbnail {
                                     url: "https://example.com/emoji.png".to_string(),
                                 }],
                             },
                         }),
                     },
-                    YtRun {
+                    Run {
                         text: Some(" bye".to_string()),
                         emoji: None,
                     },
@@ -524,8 +524,8 @@ mod tests {
 
     #[test]
     fn test_youtube_segments_empty_message() {
-        let desc = YtChatDescription {
-            author_name: YtAuthor {
+        let desc = ChatDescription {
+            author_name: Author {
                 simple_text: "TestUser".to_string(),
             },
             message: None,
@@ -539,16 +539,16 @@ mod tests {
 
     #[test]
     fn test_youtube_owner_detection() {
-        let desc = YtChatDescription {
-            author_name: YtAuthor {
+        let desc = ChatDescription {
+            author_name: Author {
                 simple_text: "Owner".to_string(),
             },
             message: None,
             purchase_amount_text: None,
             header_subtext: None,
-            author_badges: Some(vec![YtAuthorBadge {
-                live_chat_author_badge_renderer: Some(YtAuthorBadgeRenderer {
-                    icon: Some(YtBadgeIcon {
+            author_badges: Some(vec![AuthorBadge {
+                live_chat_author_badge_renderer: Some(AuthorBadgeRenderer {
+                    icon: Some(BadgeIcon {
                         icon_type: Some("OWNER".to_string()),
                     }),
                 }),
@@ -561,16 +561,16 @@ mod tests {
 
     #[test]
     fn test_youtube_moderator_detection() {
-        let desc = YtChatDescription {
-            author_name: YtAuthor {
+        let desc = ChatDescription {
+            author_name: Author {
                 simple_text: "Mod".to_string(),
             },
             message: None,
             purchase_amount_text: None,
             header_subtext: None,
-            author_badges: Some(vec![YtAuthorBadge {
-                live_chat_author_badge_renderer: Some(YtAuthorBadgeRenderer {
-                    icon: Some(YtBadgeIcon {
+            author_badges: Some(vec![AuthorBadge {
+                live_chat_author_badge_renderer: Some(AuthorBadgeRenderer {
+                    icon: Some(BadgeIcon {
                         icon_type: Some("MODERATOR".to_string()),
                     }),
                 }),
@@ -582,8 +582,8 @@ mod tests {
 
     #[test]
     fn test_youtube_no_badges() {
-        let desc = YtChatDescription {
-            author_name: YtAuthor {
+        let desc = ChatDescription {
+            author_name: Author {
                 simple_text: "User".to_string(),
             },
             message: None,
@@ -598,19 +598,19 @@ mod tests {
 
     #[test]
     fn test_youtube_segments_header_subtext() {
-        let desc = YtChatDescription {
-            author_name: YtAuthor {
+        let desc = ChatDescription {
+            author_name: Author {
                 simple_text: "TestUser".to_string(),
             },
-            message: Some(YtMessage {
-                runs: vec![YtRun {
+            message: Some(Message {
+                runs: vec![Run {
                     text: Some("main message".to_string()),
                     emoji: None,
                 }],
             }),
             purchase_amount_text: None,
-            header_subtext: Some(YtMessage {
-                runs: vec![YtRun {
+            header_subtext: Some(Message {
+                runs: vec![Run {
                     text: Some("header".to_string()),
                     emoji: None,
                 }],
@@ -649,7 +649,7 @@ mod tests {
                 }
             }
         }"#;
-        let data: YtGetLiveChat = serde_json::from_str(json).unwrap();
+        let data: GetLiveChat = serde_json::from_str(json).unwrap();
         let continuation = &data
             .continuation_contents
             .live_chat_continuation

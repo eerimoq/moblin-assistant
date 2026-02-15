@@ -1,6 +1,6 @@
 use futures_util::SinkExt;
 use log::{debug, error, info};
-use std::sync::Arc;
+use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use twitch_irc::login::StaticLoginCredentials;
@@ -8,12 +8,12 @@ use twitch_irc::message::{Emote, ServerMessage};
 use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 use crate::protocol::{
-    ChatMessage, ChatMessagesRequest, ChatPostSegment, OutgoingMessage, Platform, RequestData,
+    ChatMessage, ChatMessagesRequest, ChatPostSegment, MessageToStreamer, Platform, RequestData,
     RequestMessage, RgbColor,
 };
-use crate::{Streamer, WsWriter};
+use crate::Streamer;
 
-pub fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostSegment> {
+fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatPostSegment> {
     let mut segments: Vec<ChatPostSegment> = Vec::new();
     let mut id: i32 = 0;
     let chars: Vec<char> = message_text.chars().collect();
@@ -77,11 +77,13 @@ pub fn create_twitch_segments(message_text: &str, emotes: &[Emote]) -> Vec<ChatP
 }
 
 pub async fn connect_twitch_irc(
-    writer: WsWriter,
-    streamer: Arc<Mutex<Streamer>>,
+    streamer: Weak<Mutex<Streamer>>,
     channel_name: String,
     peer_address: String,
 ) {
+    let Some(streamer) = streamer.upgrade() else {
+        return;
+    };
     info!("[{peer_address}] Connecting to Twitch IRC for channel: {channel_name}");
 
     let credentials = StaticLoginCredentials::anonymous();
@@ -117,6 +119,7 @@ pub async fn connect_twitch_irc(
             let mut streamer = streamer.lock().await;
             let chat_message_id = streamer.next_chat_message_id();
             let request_id = streamer.next_id();
+            let writer = streamer.writer.clone();
             drop(streamer);
 
             let chat_message = ChatMessage {
@@ -137,7 +140,7 @@ pub async fn connect_twitch_irc(
                 bits: message.bits.map(|b| b.to_string()),
             };
 
-            let request = OutgoingMessage::Request(RequestMessage {
+            let request = MessageToStreamer::Request(RequestMessage {
                 id: request_id,
                 data: RequestData::ChatMessages(ChatMessagesRequest {
                     history: false,

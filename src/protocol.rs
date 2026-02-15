@@ -9,8 +9,8 @@ pub struct Authentication {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HelloMessage {
-    #[serde(rename = "apiVersion")]
     pub api_version: String,
     pub authentication: Authentication,
 }
@@ -97,13 +97,13 @@ pub struct RequestMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IdentifyData {
+pub struct IdentifyMessage {
     pub authentication: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TwitchStartData {
+pub struct TwitchStartMessage {
     pub channel_name: Option<String>,
     pub channel_id: String,
     pub access_token: String,
@@ -111,32 +111,28 @@ pub struct TwitchStartData {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct YouTubeStartData {
+pub struct YouTubeStartMessage {
     pub video_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum IncomingMessage {
-    Identify(IdentifyData),
+pub enum MessageToAssistant {
+    Identify(IdentifyMessage),
     Ping(serde_json::Value),
     Event(serde_json::Value),
-    TwitchStart(TwitchStartData),
-    #[serde(rename = "youTubeStart")]
-    YouTubeStart(YouTubeStartData),
+    TwitchStart(TwitchStartMessage),
+    YouTubeStart(YouTubeStartMessage),
     Response(serde_json::Value),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PongMessage {}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum OutgoingMessage {
+pub enum MessageToStreamer {
     Hello(HelloMessage),
     Identified(IdentifiedMessage),
-    Pong(PongMessage),
     Request(RequestMessage),
+    Pong {},
 }
 
 #[cfg(test)]
@@ -146,9 +142,9 @@ mod tests {
     #[test]
     fn test_deserialize_identify_message() {
         let json = r#"{"identify": {"authentication": "abc123"}}"#;
-        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
         match msg {
-            IncomingMessage::Identify(data) => {
+            MessageToAssistant::Identify(data) => {
                 assert_eq!(data.authentication, "abc123");
             }
             _ => panic!("Expected Identify variant"),
@@ -158,23 +154,23 @@ mod tests {
     #[test]
     fn test_deserialize_ping_message() {
         let json = r#"{"ping": {}}"#;
-        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, IncomingMessage::Ping(_)));
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, MessageToAssistant::Ping(_)));
     }
 
     #[test]
     fn test_deserialize_event_message() {
         let json = r#"{"event": {"type": "someEvent"}}"#;
-        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, IncomingMessage::Event(_)));
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, MessageToAssistant::Event(_)));
     }
 
     #[test]
     fn test_deserialize_twitch_start_message() {
         let json = r#"{"twitchStart": {"channelName": "mychannel", "channelId": "123", "accessToken": "encrypted"}}"#;
-        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
         match msg {
-            IncomingMessage::TwitchStart(data) => {
+            MessageToAssistant::TwitchStart(data) => {
                 assert_eq!(data.channel_name.as_deref(), Some("mychannel"));
                 assert_eq!(data.channel_id, "123");
                 assert_eq!(data.access_token, "encrypted");
@@ -186,9 +182,9 @@ mod tests {
     #[test]
     fn test_deserialize_twitch_start_message_minimal() {
         let json = r#"{"twitchStart": {"channelId": "123", "accessToken": "encrypted"}}"#;
-        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
         match msg {
-            IncomingMessage::TwitchStart(data) => {
+            MessageToAssistant::TwitchStart(data) => {
                 assert!(data.channel_name.is_none());
                 assert_eq!(data.channel_id, "123");
                 assert_eq!(data.access_token, "encrypted");
@@ -200,26 +196,49 @@ mod tests {
     #[test]
     fn test_deserialize_response_message() {
         let json = r#"{"response": {"id": 1}}"#;
-        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, IncomingMessage::Response(_)));
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, MessageToAssistant::Response(_)));
     }
 
     #[test]
     fn test_deserialize_unknown_message() {
         let json = r#"{"unknown": {}}"#;
-        let result: Result<IncomingMessage, _> = serde_json::from_str(json);
+        let result: Result<MessageToAssistant, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_deserialize_youtube_start_message() {
         let json = r#"{"youTubeStart": {"videoId": "abc123"}}"#;
-        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        let msg: MessageToAssistant = serde_json::from_str(json).unwrap();
         match msg {
-            IncomingMessage::YouTubeStart(data) => {
+            MessageToAssistant::YouTubeStart(data) => {
                 assert_eq!(data.video_id, "abc123");
             }
             _ => panic!("Expected YouTubeStart variant"),
         }
+    }
+
+    #[test]
+    fn test_serialize_hello_message() {
+        let message = MessageToStreamer::Hello(HelloMessage {
+            api_version: API_VERSION.to_string(),
+            authentication: Authentication {
+                challenge: "foo".to_string(),
+                salt: "bar".to_string(),
+            },
+        });
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hello":{"apiVersion":"0.1","authentication":{"challenge":"foo","salt":"bar"}}}"#
+        );
+    }
+
+    #[test]
+    fn test_serialize_pong_message() {
+        let message = MessageToStreamer::Pong {};
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(json, r#"{"pong":{}}"#);
     }
 }
