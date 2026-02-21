@@ -1,17 +1,18 @@
-use log::{error, info};
+use log::info;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 
 use crate::protocol::{ChatMessage, ChatPostSegment, Platform};
 use crate::streamer::StreamerState;
+use crate::utils::AnyError;
 
-const YOUTUBE_USER_AGENT: &str =
+const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0";
-
-const YOUTUBE_MIN_POLL_DELAY_MS: u64 = 200;
-const YOUTUBE_MAX_POLL_DELAY_MS: u64 = 3000;
-const YOUTUBE_RECONNECT_DELAY_SECS: u64 = 5;
+const MIN_POLL_DELAY: Duration = Duration::from_millis(200);
+const MAX_POLL_DELAY: Duration = Duration::from_secs(3);
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 struct Thumbnail {
@@ -108,7 +109,7 @@ struct InvalidationContinuationData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Continuations {
-    invalidation_continuation_data: Option<InvalidationContinuationData>,
+    invalidation_continuation_data: InvalidationContinuationData,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,64 +130,44 @@ struct GetLiveChat {
     continuation_contents: ContinuationContents,
 }
 
-fn create_youtube_segments(chat_description: &ChatDescription) -> Vec<ChatPostSegment> {
-    let mut segments: Vec<ChatPostSegment> = Vec::new();
-    let mut id: i32 = 0;
-
+fn create_segments(chat_description: &ChatDescription) -> Vec<ChatPostSegment> {
+    let mut segments = Vec::new();
+    let mut id = 0;
     if let Some(header_subtext) = &chat_description.header_subtext {
-        for run in &header_subtext.runs {
-            if let Some(text) = &run.text {
-                for word in text.split_whitespace() {
-                    segments.push(ChatPostSegment {
-                        id,
-                        text: Some(format!("{word} ")),
-                        url: None,
-                    });
-                    id += 1;
-                }
-            }
-            if let Some(emoji) = &run.emoji {
-                if let Some(thumbnail) = emoji.image.thumbnails.first() {
-                    segments.push(ChatPostSegment {
-                        id,
-                        text: None,
-                        url: Some(thumbnail.url.clone()),
-                    });
-                    id += 1;
-                }
-            }
-        }
+        create_segments_for_runs(&header_subtext.runs, &mut id, &mut segments);
     }
-
     if let Some(message) = &chat_description.message {
-        for run in &message.runs {
-            if let Some(text) = &run.text {
-                for word in text.split_whitespace() {
-                    segments.push(ChatPostSegment {
-                        id,
-                        text: Some(format!("{word} ")),
-                        url: None,
-                    });
-                    id += 1;
-                }
-            }
-            if let Some(emoji) = &run.emoji {
-                if let Some(thumbnail) = emoji.image.thumbnails.first() {
-                    segments.push(ChatPostSegment {
-                        id,
-                        text: None,
-                        url: Some(thumbnail.url.clone()),
-                    });
-                    id += 1;
-                }
-            }
-        }
+        create_segments_for_runs(&message.runs, &mut id, &mut segments);
     }
-
     segments
 }
 
-fn is_youtube_owner(chat_description: &ChatDescription) -> bool {
+fn create_segments_for_runs(runs: &Vec<Run>, id: &mut i32, segments: &mut Vec<ChatPostSegment>) {
+    for run in runs {
+        if let Some(text) = &run.text {
+            for word in text.split_whitespace() {
+                segments.push(ChatPostSegment {
+                    id: *id,
+                    text: Some(format!("{word} ")),
+                    url: None,
+                });
+                *id += 1;
+            }
+        }
+        if let Some(emoji) = &run.emoji {
+            if let Some(thumbnail) = emoji.image.thumbnails.first() {
+                segments.push(ChatPostSegment {
+                    id: *id,
+                    text: None,
+                    url: Some(thumbnail.url.clone()),
+                });
+                *id += 1;
+            }
+        }
+    }
+}
+
+fn is_owner(chat_description: &ChatDescription) -> bool {
     chat_description
         .author_badges
         .as_ref()
@@ -202,7 +183,7 @@ fn is_youtube_owner(chat_description: &ChatDescription) -> bool {
         .unwrap_or(false)
 }
 
-fn is_youtube_moderator(chat_description: &ChatDescription) -> bool {
+fn is_moderator(chat_description: &ChatDescription) -> bool {
     chat_description
         .author_badges
         .as_ref()
@@ -218,7 +199,7 @@ fn is_youtube_moderator(chat_description: &ChatDescription) -> bool {
         .unwrap_or(false)
 }
 
-fn is_youtube_member(chat_description: &ChatDescription) -> bool {
+fn is_member(chat_description: &ChatDescription) -> bool {
     chat_description
         .author_badges
         .as_ref()
@@ -234,35 +215,29 @@ fn is_youtube_member(chat_description: &ChatDescription) -> bool {
         .unwrap_or(false)
 }
 
-async fn youtube_get_initial_continuation(
+async fn get_initial_continuation(
     client: &reqwest::Client,
     video_id: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("https://www.youtube.com/live_chat?is_popout=1&v={video_id}");
     let response = client
         .get(&url)
-        .header("User-Agent", YOUTUBE_USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .header("Cookie", "CONSENT=YES+1")
         .send()
         .await?;
-
     if !response.status().is_success() {
-        return Err(format!(
-            "YouTube live chat page returned status {}",
-            response.status()
-        )
-        .into());
+        return Err(format!("Live chat page returned status {}", response.status()).into());
     }
-
     let body = response.text().await?;
     let re = regex::Regex::new(r#""continuation":"([^"]+)""#)?;
     let captures = re
         .captures(&body)
-        .ok_or("No continuation token found in YouTube live chat page")?;
+        .ok_or("No continuation token found in live chat page")?;
     Ok(captures[1].to_string())
 }
 
-async fn youtube_fetch_messages(
+async fn fetch_messages(
     client: &reqwest::Client,
     continuation: &str,
 ) -> Result<GetLiveChat, Box<dyn std::error::Error + Send + Sync>> {
@@ -276,149 +251,123 @@ async fn youtube_fetch_messages(
         },
         "continuation": continuation
     });
-
     let response = client
         .post(url)
-        .header("User-Agent", YOUTUBE_USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .json(&body)
         .send()
         .await?;
-
     if !response.status().is_success() {
-        return Err(format!(
-            "YouTube get_live_chat returned status {}",
-            response.status()
-        )
-        .into());
+        return Err(format!("get_live_chat returned status {}", response.status()).into());
     }
-
     let data: GetLiveChat = response.json().await?;
     Ok(data)
 }
 
-pub async fn connect_youtube_chat(
-    streamer: Arc<Mutex<StreamerState>>,
-    video_id: String,
-    peer_address: String,
-) {
-    info!("[{peer_address}] Starting YouTube chat for video: {video_id}");
+pub async fn setup_youtube_chat(streamer: Weak<Mutex<StreamerState>>, video_id: String) {
+    info!("Starting chat for video: {video_id}");
     let client = reqwest::Client::new();
-
     loop {
-        match youtube_chat_session(&client, &streamer, &video_id, &peer_address).await {
+        match chat_session(&client, &streamer, &video_id).await {
             Ok(()) => {
                 break;
             }
             Err(e) => {
-                error!("[{peer_address}] YouTube chat error: {e}, reconnecting in {YOUTUBE_RECONNECT_DELAY_SECS}s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    YOUTUBE_RECONNECT_DELAY_SECS,
-                ))
-                .await;
+                info!("Chat error: {e}, reconnecting...");
+                sleep(RECONNECT_DELAY).await;
             }
         }
     }
-
-    streamer.lock().await.youtube_running = false;
-    info!("[{peer_address}] YouTube chat connection ended");
+    if let Some(ref streamer) = streamer.upgrade() {
+        streamer.lock().await.destroy_youtube_chat();
+    }
+    info!("Chat disconnected for video :{video_id}");
 }
 
-async fn youtube_chat_session(
+async fn chat_session(
     client: &reqwest::Client,
-    streamer: &Arc<Mutex<StreamerState>>,
+    streamer: &Weak<Mutex<StreamerState>>,
     video_id: &str,
-    peer_address: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut continuation = youtube_get_initial_continuation(client, video_id).await?;
-    info!("[{peer_address}] Got YouTube continuation token, starting message polling");
-
-    let mut delay_ms = YOUTUBE_MAX_POLL_DELAY_MS;
-
+) -> Result<(), AnyError> {
+    let mut continuation = get_initial_continuation(client, video_id).await?;
+    let mut delay = MAX_POLL_DELAY;
     loop {
-        let live_chat = youtube_fetch_messages(client, &continuation).await?;
-
-        let mut message_count = 0;
-
-        if let Some(actions) = &live_chat
-            .continuation_contents
-            .live_chat_continuation
-            .actions
-        {
-            for action in actions {
-                let item = match &action.add_chat_item_action {
-                    Some(a) => &a.item,
-                    None => continue,
-                };
-
-                let descriptions: Vec<&ChatDescription> = [
-                    item.live_chat_text_message_renderer.as_ref(),
-                    item.live_chat_paid_message_renderer.as_ref(),
-                    item.live_chat_paid_sticker_renderer.as_ref(),
-                    item.live_chat_membership_item_renderer.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-
-                for chat_description in descriptions {
-                    let segments = create_youtube_segments(chat_description);
-                    if segments.is_empty() {
-                        continue;
-                    }
-
-                    let is_owner = is_youtube_owner(chat_description);
-                    let is_moderator = is_youtube_moderator(chat_description);
-                    let is_subscriber = is_youtube_member(chat_description);
-                    let display_name = chat_description.author_name.simple_text.clone();
-
-                    let mut streamer = streamer.lock().await;
-
-                    let message = ChatMessage {
-                        id: streamer.next_chat_message_id(),
-                        platform: Platform::YouTube {},
-                        message_id: None,
-                        display_name: Some(display_name.clone()),
-                        user: Some(display_name),
-                        user_id: None,
-                        user_color: None,
-                        user_badges: vec![],
-                        segments,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        is_action: false,
-                        is_moderator,
-                        is_subscriber,
-                        is_owner,
-                        bits: None,
-                    };
-
-                    streamer.append_chat_message(message).await;
-                    message_count += 1;
-                }
-            }
-        }
-
-        let new_continuation = live_chat
-            .continuation_contents
-            .live_chat_continuation
-            .continuations
-            .iter()
-            .find_map(|c| {
-                c.invalidation_continuation_data
-                    .as_ref()
-                    .map(|d| d.continuation.clone())
-            })
-            .ok_or("No continuation token in YouTube response")?;
-        continuation = new_continuation;
-
+        let live_chat = fetch_messages(client, &continuation).await?;
+        let Some(ref streamer) = streamer.upgrade() else {
+            return Ok(());
+        };
+        let live_chat_continuation = &live_chat.continuation_contents.live_chat_continuation;
+        let message_count = process_actions(streamer, &live_chat_continuation.actions).await;
+        let Some(first_continuation) = live_chat_continuation.continuations.first() else {
+            return Err("Continuation missing".into());
+        };
+        continuation = first_continuation
+            .invalidation_continuation_data
+            .continuation
+            .clone();
         if message_count > 0 {
-            delay_ms = delay_ms * 5 / message_count as u64;
+            delay = delay * 5 / message_count;
+            delay = delay.clamp(MIN_POLL_DELAY, MAX_POLL_DELAY);
         } else {
-            delay_ms = YOUTUBE_MAX_POLL_DELAY_MS;
+            delay = MAX_POLL_DELAY;
         }
-        delay_ms = delay_ms.clamp(YOUTUBE_MIN_POLL_DELAY_MS, YOUTUBE_MAX_POLL_DELAY_MS);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        sleep(delay).await;
     }
+}
+
+async fn process_actions(
+    streamer: &Arc<Mutex<StreamerState>>,
+    actions: &Option<Vec<Action>>,
+) -> u32 {
+    let Some(actions) = &actions else {
+        return 0;
+    };
+    let mut message_count = 0;
+    for action in actions {
+        let item = match &action.add_chat_item_action {
+            Some(a) => &a.item,
+            None => continue,
+        };
+        let descriptions = [
+            item.live_chat_text_message_renderer.as_ref(),
+            item.live_chat_paid_message_renderer.as_ref(),
+            item.live_chat_paid_sticker_renderer.as_ref(),
+            item.live_chat_membership_item_renderer.as_ref(),
+        ]
+        .into_iter()
+        .flatten();
+        for description in descriptions {
+            let segments = create_segments(description);
+            if segments.is_empty() {
+                continue;
+            }
+            let is_owner = is_owner(description);
+            let is_moderator = is_moderator(description);
+            let is_subscriber = is_member(description);
+            let display_name = description.author_name.simple_text.clone();
+            let mut streamer = streamer.lock().await;
+            let message = ChatMessage {
+                id: streamer.next_chat_message_id(),
+                platform: Platform::YouTube {},
+                message_id: None,
+                display_name: Some(display_name.clone()),
+                user: Some(display_name),
+                user_id: None,
+                user_color: None,
+                user_badges: vec![],
+                segments,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                is_action: false,
+                is_moderator,
+                is_subscriber,
+                is_owner,
+                bits: None,
+            };
+            streamer.append_chat_message(message).await;
+            message_count += 1;
+        }
+    }
+    message_count
 }
 
 #[cfg(test)]
@@ -426,7 +375,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_youtube_segments_text_only() {
+    fn test_segments_text_only() {
         let desc = ChatDescription {
             author_name: Author {
                 simple_text: "TestUser".to_string(),
@@ -441,14 +390,14 @@ mod tests {
             header_subtext: None,
             author_badges: None,
         };
-        let segments = create_youtube_segments(&desc);
+        let segments = create_segments(&desc);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].text.as_deref(), Some("hello "));
         assert_eq!(segments[1].text.as_deref(), Some("world "));
     }
 
     #[test]
-    fn test_youtube_segments_with_emoji() {
+    fn test_segments_with_emoji() {
         let desc = ChatDescription {
             author_name: Author {
                 simple_text: "TestUser".to_string(),
@@ -479,7 +428,7 @@ mod tests {
             header_subtext: None,
             author_badges: None,
         };
-        let segments = create_youtube_segments(&desc);
+        let segments = create_segments(&desc);
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0].text.as_deref(), Some("hi "));
         assert!(segments[0].url.is_none());
@@ -492,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_youtube_segments_empty_message() {
+    fn test_segments_empty_message() {
         let desc = ChatDescription {
             author_name: Author {
                 simple_text: "TestUser".to_string(),
@@ -502,12 +451,12 @@ mod tests {
             header_subtext: None,
             author_badges: None,
         };
-        let segments = create_youtube_segments(&desc);
+        let segments = create_segments(&desc);
         assert!(segments.is_empty());
     }
 
     #[test]
-    fn test_youtube_owner_detection() {
+    fn test_owner_detection() {
         let desc = ChatDescription {
             author_name: Author {
                 simple_text: "Owner".to_string(),
@@ -523,13 +472,13 @@ mod tests {
                 }),
             }]),
         };
-        assert!(is_youtube_owner(&desc));
-        assert!(!is_youtube_moderator(&desc));
-        assert!(!is_youtube_member(&desc));
+        assert!(is_owner(&desc));
+        assert!(!is_moderator(&desc));
+        assert!(!is_member(&desc));
     }
 
     #[test]
-    fn test_youtube_moderator_detection() {
+    fn test_moderator_detection() {
         let desc = ChatDescription {
             author_name: Author {
                 simple_text: "Mod".to_string(),
@@ -545,12 +494,12 @@ mod tests {
                 }),
             }]),
         };
-        assert!(!is_youtube_owner(&desc));
-        assert!(is_youtube_moderator(&desc));
+        assert!(!is_owner(&desc));
+        assert!(is_moderator(&desc));
     }
 
     #[test]
-    fn test_youtube_no_badges() {
+    fn test_no_badges() {
         let desc = ChatDescription {
             author_name: Author {
                 simple_text: "User".to_string(),
@@ -560,13 +509,13 @@ mod tests {
             header_subtext: None,
             author_badges: None,
         };
-        assert!(!is_youtube_owner(&desc));
-        assert!(!is_youtube_moderator(&desc));
-        assert!(!is_youtube_member(&desc));
+        assert!(!is_owner(&desc));
+        assert!(!is_moderator(&desc));
+        assert!(!is_member(&desc));
     }
 
     #[test]
-    fn test_youtube_segments_header_subtext() {
+    fn test_segments_header_subtext() {
         let desc = ChatDescription {
             author_name: Author {
                 simple_text: "TestUser".to_string(),
@@ -586,7 +535,7 @@ mod tests {
             }),
             author_badges: None,
         };
-        let segments = create_youtube_segments(&desc);
+        let segments = create_segments(&desc);
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0].text.as_deref(), Some("header "));
         assert_eq!(segments[1].text.as_deref(), Some("main "));
@@ -594,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_youtube_live_chat_response() {
+    fn test_deserialize_live_chat_response() {
         let json = r#"{
             "continuationContents": {
                 "liveChatContinuation": {
@@ -624,11 +573,7 @@ mod tests {
             .live_chat_continuation
             .continuations[0];
         assert_eq!(
-            continuation
-                .invalidation_continuation_data
-                .as_ref()
-                .unwrap()
-                .continuation,
+            continuation.invalidation_continuation_data.continuation,
             "next_token"
         );
         let actions = data

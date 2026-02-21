@@ -1,11 +1,12 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use futures_util::SinkExt;
-use log::{debug, error, info};
+use futures_util::{SinkExt, StreamExt};
+use log::{debug, info};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
-use tokio::time::Instant;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::protocol::{
@@ -14,61 +15,44 @@ use crate::protocol::{
     RequestMessage, TwitchStartMessage, YouTubeStartMessage, API_VERSION,
 };
 use crate::utils::{random_string, AnyError};
-use crate::{twitch, youtube, ActiveStreamers, DisconnectedStreamers, WebsocketWriter};
+use crate::{twitch, youtube, DisconnectedStreamer, Streamer, Streamers, WebsocketWriter};
 
 pub struct StreamerState {
-    writer: WebsocketWriter,
+    me: Weak<Mutex<Self>>,
+    writer: Option<WebsocketWriter>,
     request_id: i32,
     chat_message_id: i32,
     chat_messages: VecDeque<ChatMessage>,
-    pub twitch_running: bool,
-    pub youtube_running: bool,
+    twitch_chat: Option<JoinHandle<()>>,
+    youtube_chat: Option<JoinHandle<()>>,
 }
 
 impl StreamerState {
     pub fn new(writer: WebsocketWriter) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            writer,
-            request_id: 0,
-            chat_message_id: 0,
-            chat_messages: VecDeque::new(),
-            twitch_running: false,
-            youtube_running: false,
-        }))
+        Arc::new_cyclic(|me| {
+            Mutex::new(Self {
+                me: me.clone(),
+                writer: Some(writer),
+                request_id: 0,
+                chat_message_id: 0,
+                chat_messages: VecDeque::new(),
+                twitch_chat: None,
+                youtube_chat: None,
+            })
+        })
     }
 
-    pub fn next_request_id(&mut self) -> i32 {
-        self.request_id += 1;
-        self.request_id
+    pub fn destroy_twitch_chat(&mut self) {
+        self.twitch_chat = None
+    }
+
+    pub fn destroy_youtube_chat(&mut self) {
+        self.youtube_chat = None
     }
 
     pub fn next_chat_message_id(&mut self) -> i32 {
         self.chat_message_id += 1;
         self.chat_message_id
-    }
-
-    pub fn store_chat_message(&mut self, message: ChatMessage) {
-        if self.chat_messages.len() >= 100 {
-            self.chat_messages.pop_front();
-        }
-        self.chat_messages.push_back(message);
-    }
-
-    pub async fn send_chat_history(&mut self) {
-        let request = MessageToStreamer::Request(RequestMessage {
-            id: self.next_request_id(),
-            data: RequestData::ChatMessages(ChatMessagesRequest {
-                history: true,
-                messages: self.chat_messages.clone().into(),
-            }),
-        });
-        if let Ok(encoded) = serde_json::to_string(&request) {
-            self.send(Message::Text(encoded)).await;
-        }
-    }
-
-    async fn send(&self, message: Message) {
-        self.writer.lock().await.send(message).await.ok();
     }
 
     pub async fn append_chat_message(&mut self, message: ChatMessage) {
@@ -80,9 +64,40 @@ impl StreamerState {
                 messages: vec![message],
             }),
         });
-        if let Ok(encoded) = serde_json::to_string(&request) {
-            self.send(Message::Text(encoded)).await;
+        self.send(request).await;
+    }
+
+    fn next_request_id(&mut self) -> i32 {
+        self.request_id += 1;
+        self.request_id
+    }
+
+    fn store_chat_message(&mut self, message: ChatMessage) {
+        if self.chat_messages.len() >= 100 {
+            self.chat_messages.pop_front();
         }
+        self.chat_messages.push_back(message);
+    }
+
+    async fn send_chat_history(&mut self) {
+        let request = MessageToStreamer::Request(RequestMessage {
+            id: self.next_request_id(),
+            data: RequestData::ChatMessages(ChatMessagesRequest {
+                history: true,
+                messages: self.chat_messages.clone().into(),
+            }),
+        });
+        self.send(request).await;
+    }
+
+    async fn send(&self, message: MessageToStreamer) {
+        let Some(ref writer) = self.writer else {
+            return;
+        };
+        let Ok(encoded) = serde_json::to_string(&message) else {
+            return;
+        };
+        writer.lock().await.send(Message::Text(encoded)).await.ok();
     }
 }
 
@@ -95,9 +110,8 @@ pub struct StreamerConnection {
     salt: String,
     identified: bool,
     streamer_id: Option<String>,
-    disconnected_streamers: DisconnectedStreamers,
-    active_streamers: ActiveStreamers,
-    pub state: Option<Arc<Mutex<StreamerState>>>,
+    streamers: Streamers,
+    state: Option<Arc<Mutex<StreamerState>>>,
 }
 
 impl StreamerConnection {
@@ -105,8 +119,7 @@ impl StreamerConnection {
         password: String,
         peer_address: String,
         writer: WebsocketWriter,
-        disconnected_streamers: DisconnectedStreamers,
-        active_streamers: ActiveStreamers,
+        streamers: Streamers,
     ) -> Arc<Mutex<Self>> {
         Arc::new_cyclic(|me| {
             Mutex::new(Self {
@@ -119,8 +132,7 @@ impl StreamerConnection {
                 identified: false,
                 state: Some(StreamerState::new(writer)),
                 streamer_id: None,
-                disconnected_streamers,
-                active_streamers,
+                streamers,
             })
         })
     }
@@ -136,7 +148,7 @@ impl StreamerConnection {
         BASE64.encode(hasher.finalize())
     }
 
-    pub async fn send_hello(&mut self) {
+    async fn send_hello(&mut self) {
         let hello = MessageToStreamer::Hello(HelloMessage {
             api_version: API_VERSION.to_string(),
             authentication: Authentication {
@@ -148,18 +160,19 @@ impl StreamerConnection {
     }
 
     async fn send(&mut self, message: MessageToStreamer) {
-        if let Ok(encoded) = serde_json::to_string(&message) {
-            self.writer
-                .lock()
-                .await
-                .send(Message::Text(encoded))
-                .await
-                .ok();
-        }
+        let Ok(encoded) = serde_json::to_string(&message) else {
+            return;
+        };
+        self.writer
+            .lock()
+            .await
+            .send(Message::Text(encoded))
+            .await
+            .ok();
     }
 
-    pub async fn handle_message(&mut self, message: &str) -> Result<(), AnyError> {
-        debug!("[{}] Received message: {}", self.peer_address, message);
+    async fn handle_message(&mut self, message: &str) -> Result<(), AnyError> {
+        debug!("{}: Received message: {}", self.peer_address, message);
         match serde_json::from_str(message)? {
             MessageToAssistant::Identify(identify) => {
                 self.handle_identify(identify).await;
@@ -183,63 +196,64 @@ impl StreamerConnection {
         Ok(())
     }
 
-    pub async fn handle_identify(&mut self, identify: IdentifyMessage) {
-        let result = if self.identified {
-            self.handle_identify_already_identified()
+    async fn handle_identify(&mut self, identify: IdentifyMessage) {
+        if self.identified {
+            self.handle_identify_already_identified().await;
         } else if identify.authentication == self.hash_password() {
-            self.handle_identify_corrent_password(identify).await
+            self.handle_identify_correct_password(identify).await;
         } else {
-            self.handle_identify_wrong_password()
+            self.handle_identify_wrong_password().await;
         };
-        self.send(MessageToStreamer::Identified(IdentifiedMessage { result }))
+    }
+
+    async fn handle_identify_already_identified(&mut self) {
+        debug!("{}: Streamer already identified", self.peer_address);
+        self.send_identified(IdentifiedResult::AlreadyIdentified {})
             .await;
+    }
+
+    async fn handle_identify_correct_password(&mut self, identify: IdentifyMessage) {
+        debug!("{}: Streamer identified", self.peer_address);
+        self.identified = true;
+        self.streamer_id = identify.streamer_id;
+        if let Some(ref streamer_id) = self.streamer_id {
+            let mut streamers = self.streamers.lock().await;
+            if let Some(streamer) = streamers.remove(streamer_id) {
+                match streamer {
+                    Streamer::Connected(streamer) => {
+                        if let Some(streamer) = streamer.upgrade() {
+                            let mut streamer = streamer.lock().await;
+                            self.state = streamer.state.take();
+                            streamer.writer.lock().await.close().await.ok();
+                        }
+                    }
+                    Streamer::Disconnected(streamer) => {
+                        self.state = Some(streamer.state);
+                    }
+                }
+            }
+            if let Some(ref state) = self.state {
+                state.lock().await.writer = Some(self.writer.clone());
+            } else {
+                self.state = Some(StreamerState::new(self.writer.clone()));
+            }
+            streamers.insert(streamer_id.clone(), Streamer::Connected(self.me.clone()));
+        }
+        self.send_identified(IdentifiedResult::Ok {}).await;
         if let Some(ref state) = self.state {
             state.lock().await.send_chat_history().await;
         }
     }
 
-    fn handle_identify_already_identified(&self) -> IdentifiedResult {
-        debug!("[{}] Streamer already identified", self.peer_address);
-        IdentifiedResult::AlreadyIdentified {}
+    async fn handle_identify_wrong_password(&mut self) {
+        info!("{}: Wrong password from streamer", self.peer_address);
+        self.send_identified(IdentifiedResult::WrongPassword {})
+            .await;
     }
 
-    async fn handle_identify_corrent_password(
-        &mut self,
-        identify: IdentifyMessage,
-    ) -> IdentifiedResult {
-        info!("[{}] Streamer successfully identified", self.peer_address);
-        self.identified = true;
-        self.streamer_id = identify.streamer_id;
-        if let Some(ref streamer_id) = self.streamer_id {
-            if let Some(streamer) = self
-                .active_streamers
-                .lock()
-                .await
-                .remove(streamer_id)
-                .and_then(|streamer| streamer.upgrade())
-            {
-                self.state = streamer.lock().await.state.take();
-            } else if let Some((state, _)) =
-                self.disconnected_streamers.lock().await.remove(streamer_id)
-            {
-                self.state = Some(state);
-            }
-            if let Some(ref state) = self.state {
-                state.lock().await.writer = self.writer.clone();
-            } else {
-                self.state = Some(StreamerState::new(self.writer.clone()));
-            }
-            self.active_streamers
-                .lock()
-                .await
-                .insert(streamer_id.clone(), self.me.clone());
-        }
-        IdentifiedResult::Ok {}
-    }
-
-    fn handle_identify_wrong_password(&self) -> IdentifiedResult {
-        error!("[{}] Wrong password from streamer", self.peer_address);
-        IdentifiedResult::WrongPassword {}
+    async fn send_identified(&mut self, result: IdentifiedResult) {
+        self.send(MessageToStreamer::Identified(IdentifiedMessage { result }))
+            .await;
     }
 
     async fn handle_ping(&mut self) {
@@ -250,7 +264,7 @@ impl StreamerConnection {
         if !self.identified {
             return;
         }
-        debug!("[{}] Received event from streamer", self.peer_address);
+        debug!("{}: Received event from streamer", self.peer_address);
     }
 
     async fn handle_twitch_start(&mut self, twitch_start: TwitchStartMessage) {
@@ -261,25 +275,16 @@ impl StreamerConnection {
             return;
         };
         let mut state = state_shared.lock().await;
-        if state.twitch_running {
-            info!(
-                "[{}] Twitch connection already running, ignoring start",
-                self.peer_address
-            );
+        if state.twitch_chat.is_some() {
             return;
         }
-        if let Some(channel_name) = &twitch_start.channel_name {
-            info!(
-                "[{}] Starting Twitch IRC connection for channel: {}",
-                self.peer_address, channel_name
-            );
-            state.twitch_running = true;
-            tokio::spawn(twitch::connect_twitch_irc(
-                state_shared.clone(),
-                channel_name.to_lowercase(),
-                self.peer_address.clone(),
-            ));
-        }
+        let Some(channel_name) = &twitch_start.channel_name else {
+            return;
+        };
+        state.twitch_chat = Some(tokio::spawn(twitch::setup_twitch_chat(
+            state.me.clone(),
+            channel_name.to_lowercase(),
+        )));
     }
 
     async fn handle_youtube_start(&mut self, youtube_start: YouTubeStartMessage) {
@@ -290,46 +295,83 @@ impl StreamerConnection {
             return;
         };
         let mut state = state_shared.lock().await;
-        if state.youtube_running {
-            info!(
-                "[{}] YouTube connection already running, ignoring start",
-                self.peer_address
-            );
+        if state.youtube_chat.is_some() {
             return;
         }
-        info!(
-            "[{}] Starting YouTube chat for video: {}",
-            self.peer_address, youtube_start.video_id
-        );
-        state.youtube_running = true;
-        tokio::spawn(youtube::connect_youtube_chat(
-            state_shared.clone(),
+        state.youtube_chat = Some(tokio::spawn(youtube::setup_youtube_chat(
+            state.me.clone(),
             youtube_start.video_id.clone(),
-            self.peer_address.clone(),
-        ));
+        )));
     }
 
     async fn handle_response(&mut self) {
         if !self.identified {
             return;
         }
-        debug!("[{}] Received response from streamer", self.peer_address);
+        debug!("{}: Received response from streamer", self.peer_address);
     }
 
-    pub async fn stop(&mut self) {
+    async fn stop(&mut self) {
         if !self.identified {
             return;
         }
         let Some(ref streamer_id) = self.streamer_id else {
             return;
         };
-        self.active_streamers.lock().await.remove(streamer_id);
-        let Some(ref state) = self.state else {
+        let mut streamers = self.streamers.lock().await;
+        let Some(state) = self.state.take() else {
             return;
         };
-        self.disconnected_streamers
-            .lock()
-            .await
-            .insert(streamer_id.clone(), (state.clone(), Instant::now()));
+        state.lock().await.writer = None;
+        streamers.insert(
+            streamer_id.clone(),
+            Streamer::Disconnected(DisconnectedStreamer::new(state)),
+        );
     }
+}
+
+pub async fn handle_streamer(
+    stream: tokio::net::TcpStream,
+    peer_address: String,
+    password: String,
+    streamers: Streamers,
+) {
+    let Ok(stream) = accept_async(stream).await else {
+        return;
+    };
+    info!("{peer_address}: Streamer connected");
+    let (writer, mut reader) = stream.split();
+    let writer = Arc::new(Mutex::new(writer));
+    let streamer =
+        StreamerConnection::new(password, peer_address.clone(), writer.clone(), streamers);
+    streamer.lock().await.send_hello().await;
+    while let Some(Ok(message)) = reader.next().await {
+        match message {
+            Message::Text(text) => {
+                if let Err(e) = streamer.lock().await.handle_message(&text).await {
+                    info!("{peer_address}: Error handling text: {e}");
+                    break;
+                }
+            }
+            Message::Ping(data) => {
+                if let Err(e) = handle_ping(data, &writer).await {
+                    info!("{peer_address}: Error handling ping: {e}");
+                    break;
+                }
+            }
+            Message::Close(_) => {
+                debug!("{peer_address}: Connection closed by streamer");
+                break;
+            }
+            _ => {}
+        }
+    }
+    streamer.lock().await.stop().await;
+    info!("{peer_address}: Streamer disconnected");
+}
+
+async fn handle_ping(data: Vec<u8>, writer: &WebsocketWriter) -> Result<(), AnyError> {
+    let mut writer = writer.lock().await;
+    writer.send(Message::Pong(data)).await?;
+    Ok(())
 }
